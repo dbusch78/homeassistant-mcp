@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "homeassistant": {
+      "command": "./start_server.sh",
+      "env": {},
+      "args": []
+    }
+  }
+}
