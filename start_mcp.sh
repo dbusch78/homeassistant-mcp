@@ -3,9 +3,13 @@
 # Loads credentials from .env and starts the MCP server via stdio
 cd "$(dirname "$0")"
 
-# Load .env if present
+# Load .env if present.
+# Source with auto-export so quoted values, spaces, and #-comments survive
+# (the old `export $(grep -v '^#' .env | xargs)` mangled all three).
 if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+    set -a
+    . ./.env
+    set +a
 fi
 
 # Validate required environment variables

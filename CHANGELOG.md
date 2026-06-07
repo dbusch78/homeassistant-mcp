@@ -38,6 +38,9 @@ patch release. Changes relative to the upstream baseline are recorded under the
 - `start_mcp.sh` now uses the `venv/` virtualenv to match `setup.sh` and
   `start_server.sh` (it referenced a nonexistent `.venv/`, so the script failed
   for anyone who ran the documented `setup.sh`).
+- Startup scripts now load `.env` via `set -a; . ./.env; set +a` instead of
+  `export $(cat .env | xargs)`. The old form errored on `#` comments and mangled
+  any value containing spaces or quotes; the new form sources them correctly.
 
 ## [1.0.0] — Fork baseline
 
