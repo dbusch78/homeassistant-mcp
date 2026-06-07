@@ -41,6 +41,8 @@ patch release. Changes relative to the upstream baseline are recorded under the
 - Startup scripts now load `.env` via `set -a; . ./.env; set +a` instead of
   `export $(cat .env | xargs)`. The old form errored on `#` comments and mangled
   any value containing spaces or quotes; the new form sources them correctly.
+- README now states Python 3.10+ to match `pyproject.toml`'s `requires-python =
+  ">=3.10"` (it claimed 3.11+; the code uses no 3.11-only features).
 
 ## [1.0.0] — Fork baseline
 

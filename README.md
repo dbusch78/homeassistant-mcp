@@ -16,7 +16,7 @@ A comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.10+
 - Home Assistant instance (local or remote, HTTP or HTTPS)
 - A Home Assistant [long-lived access token](https://developers.home-assistant.io/docs/auth_api/#long-lived-access-token)
 
