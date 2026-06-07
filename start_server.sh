@@ -3,9 +3,13 @@
 # Change to the directory where this script is located
 cd "$(dirname "$0")"
 
-# Load environment variables from .env file if it exists
+# Load environment variables from .env file if it exists.
+# Source with auto-export so quoted values, spaces, and #-comments survive
+# (the old `export $(cat .env | xargs)` mangled all three).
 if [ -f .env ]; then
-    export $(cat .env | xargs)
+    set -a
+    . ./.env
+    set +a
 fi
 
 # Check if HA_TOKEN is set
