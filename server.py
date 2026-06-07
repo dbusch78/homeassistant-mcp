@@ -1020,7 +1020,14 @@ class SSESubscription:
         return True
 
 class SSEManager:
-    """Manages SSE connections and subscriptions"""
+    """Manages SSE connections and subscriptions.
+
+    TODO: implement in feature/sse-streaming on HTTP transport. This machinery is
+    retained but not wired to the tool layer — under stdio there is no channel to
+    push events to the client, so subscribe_events/get_sse_stats currently return
+    a not_implemented response (see handle_call_tool). _handle_ha_event only logs
+    events; real delivery lands with the streamable-HTTP transport.
+    """
     
     def __init__(self):
         self.subscriptions: Dict[str, SSESubscription] = {}
@@ -2869,29 +2876,30 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 result = await client.handle_intent(intent_name, intent_data)
                 
             elif name == "subscribe_events":
-                # Handle SSE subscription
-                events = set(arguments.get("events", []))
-                entity_id = arguments.get("entity_id")
-                domain = arguments.get("domain")
-                
-                try:
-                    client_id = sse_manager.add_subscription(events, entity_id, domain)
-                    # Start the event stream
-                    await sse_manager.start_event_stream(client_id, HA_URL, HA_TOKEN)
-                    
-                    result = {
-                        "status": "subscribed",
-                        "client_id": client_id,
-                        "events": list(events),
-                        "entity_id": entity_id,
-                        "domain": domain,
-                        "message": "Successfully subscribed to Home Assistant events"
-                    }
-                except ValueError as e:
-                    result = {"error": str(e)}
-                
+                # Real-time streaming is not wired up: the stdio transport has no
+                # channel to push events to the client, and SSEManager only logged
+                # events without delivering them. Report that honestly instead of
+                # claiming a successful subscription that never emits anything.
+                # See feature/sse-streaming (planned, on the HTTP transport).
+                result = {
+                    "error": "not_implemented",
+                    "message": (
+                        "Real-time event streaming is not yet supported in stdio "
+                        "transport. Use get_history or poll get_entity_state for state "
+                        "changes. Event streaming will be implemented as a feature on "
+                        "the HTTP transport."
+                    ),
+                    "alternatives": ["get_history", "get_entity_state", "get_logbook"],
+                }
+
             elif name == "get_sse_stats":
-                result = sse_manager.get_stats()
+                result = {
+                    "error": "not_implemented",
+                    "message": (
+                        "SSE statistics are not available. Event streaming is pending "
+                        "implementation on HTTP transport."
+                    ),
+                }
                 
             elif name == "get_automations":
                 result = await client.get_automations(
