@@ -35,6 +35,9 @@ patch release. Changes relative to the upstream baseline are recorded under the
   responses instead of silently failing (upstream bug: server.py:1152). Real-time
   streaming is deferred to `feature/sse-streaming` on the HTTP transport; the
   `SSEManager` class is retained and marked with a TODO.
+- `start_mcp.sh` now uses the `venv/` virtualenv to match `setup.sh` and
+  `start_server.sh` (it referenced a nonexistent `.venv/`, so the script failed
+  for anyone who ran the documented `setup.sh`).
 
 ## [1.0.0] — Fork baseline
 
