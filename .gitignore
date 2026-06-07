@@ -121,3 +121,7 @@ dmypy.json
 
 # Project specific
 homeassistant-mcp.log
+
+# Local deployment context — contains internal network topology (VLANs) and the
+# Home Assistant host IP. Must never be committed to the public fork.
+CLAUDE.md
