@@ -31,6 +31,10 @@ patch release. Changes relative to the upstream baseline are recorded under the
   area name (case-insensitively, including aliases) to an `area_id` and delegates
   to the working `get_entities_by_area` lookup, returning a clear `area_not_found`
   error (with the list of known areas) when no area matches.
+- `subscribe_events` and `get_sse_stats` now return explicit not-implemented
+  responses instead of silently failing (upstream bug: server.py:1152). Real-time
+  streaming is deferred to `feature/sse-streaming` on the HTTP transport; the
+  `SSEManager` class is retained and marked with a TODO.
 
 ## [1.0.0] — Fork baseline
 
