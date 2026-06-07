@@ -2757,9 +2757,26 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 result = filtered_entities
                 
             elif name == "get_area_entities":
-                # This would require additional API calls to get area information
-                # For now, return a placeholder
-                result = {"message": "Area entity lookup requires additional implementation"}
+                # Resolve the human-friendly area name to an area_id, then reuse the
+                # working get_entities_by_area lookup. Match the name case-insensitively
+                # against each area's name and its aliases.
+                area_name = arguments["area_name"]
+                target = area_name.strip().lower()
+                areas = await client.get_areas()
+                area_id = None
+                for area in areas:
+                    names = [area.get("name", "")] + list(area.get("aliases") or [])
+                    if any((n or "").strip().lower() == target for n in names):
+                        area_id = area.get("area_id")
+                        break
+                if area_id is None:
+                    result = {
+                        "error": "area_not_found",
+                        "message": f"No area matched name '{area_name}'.",
+                        "available_areas": [a.get("name") for a in areas],
+                    }
+                else:
+                    result = await client.get_entities_by_area(area_id=area_id)
                 
             elif name == "fire_event":
                 event_type = arguments["event_type"]
