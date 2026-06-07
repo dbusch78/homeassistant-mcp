@@ -22,6 +22,11 @@ patch release. Changes relative to the upstream baseline are recorded under the
   context (VLAN topology, Home Assistant host IP) is never committed to the public
   fork.
 
+### Fixed
+- Remove duplicate `restart_homeassistant` tool definition. The tool was declared
+  twice in `handle_list_tools` (upstream bug), so the server advertised 88 tool
+  entries for 87 distinct tools; some MCP clients reject duplicate tool names.
+
 ## [1.0.0] — Fork baseline
 
 Initial fork of `maximeallanic/homeassistant-mcp`. Subsequent fixes, security work,
