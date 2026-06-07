@@ -14,4 +14,4 @@ if [ -z "$HA_URL" ] || [ -z "$HA_TOKEN" ]; then
     exit 1
 fi
 
-exec .venv/bin/python server.py
+exec venv/bin/python server.py
