@@ -2582,12 +2582,7 @@ async def handle_list_tools() -> List[Tool]:
                 "required": ["repository_id"]
             }
         ),
-        # HA restart & integration management
-        Tool(
-            name="restart_homeassistant",
-            description="Restart Home Assistant core (graceful restart, keeps add-ons running)",
-            inputSchema={"type": "object", "properties": {}}
-        ),
+        # Integration config-entry management
         Tool(
             name="list_config_entries",
             description="List all configured integrations (config entries) in Home Assistant",
