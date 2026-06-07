@@ -26,6 +26,11 @@ patch release. Changes relative to the upstream baseline are recorded under the
 - Remove duplicate `restart_homeassistant` tool definition. The tool was declared
   twice in `handle_list_tools` (upstream bug), so the server advertised 88 tool
   entries for 87 distinct tools; some MCP clients reject duplicate tool names.
+- `get_area_entities` now actually works. Upstream it returned the placeholder
+  `"Area entity lookup requires additional implementation"`. It now resolves the
+  area name (case-insensitively, including aliases) to an `area_id` and delegates
+  to the working `get_entities_by_area` lookup, returning a clear `area_not_found`
+  error (with the list of known areas) when no area matches.
 
 ## [1.0.0] — Fork baseline
 
