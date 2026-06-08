@@ -11,6 +11,7 @@ Provides tools to interact with Home Assistant API including:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -3249,11 +3250,11 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
             text=json.dumps({"error": str(e)})
         )]
 
-async def main():
-    """Run the MCP server"""
+async def run_stdio():
+    """Run the MCP server over stdio (default; Claude Desktop, start_mcp.sh)."""
     # Import here to avoid issues if mcp package isn't available
     from mcp.server.stdio import stdio_server
-    
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
@@ -3268,9 +3269,177 @@ async def main():
             ),
         )
 
+
+# Backwards-compatible alias: the original entry point was main() (stdio).
+main = run_stdio
+
+
+def _is_loopback(host: str) -> bool:
+    """True only for loopback hosts. 0.0.0.0 binds all interfaces and is NOT loopback."""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _build_security_settings(host: str, port: int):
+    """Build DNS-rebinding protection settings for the HTTP transport.
+
+    We ALWAYS construct explicit settings with protection enabled. This is
+    deliberate and load-bearing: the SDK's TransportSecurityMiddleware, when given
+    no settings, defaults to enable_dns_rebinding_protection=False ("backwards
+    compatibility"). Passing security_settings=None to the session manager would
+    therefore silently disable ALL Host/Origin validation. Never rely on that
+    default — build settings here every time.
+
+    Defaults are exact, single-entry lists derived from the bind host:port:
+        allowed_hosts   = ["127.0.0.1:8787"]          (Host header must match exactly)
+        allowed_origins = ["http://127.0.0.1:8787"]   (Origin, if present, must match)
+    Note this means connecting via http://localhost:8787 is REJECTED on a 127.0.0.1
+    bind (Host "localhost:8787" != "127.0.0.1:8787"). Override with MCP_ALLOWED_HOSTS
+    / MCP_ALLOWED_ORIGINS (comma-separated) if you need additional names.
+
+    NOTE: Origin header absent = allowed (non-browser clients). Claude Code and other
+    non-browser MCP clients send no Origin header, and the SDK's _validate_origin
+    returns True when Origin is missing — so there is NO Origin check for requests
+    that omit it. This is correct for our non-browser clients. Do NOT expose this
+    endpoint to a browser-accessible context without adding explicit Origin
+    enforcement, or DNS-rebinding protection via Origin is bypassable.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts_env = os.getenv("MCP_ALLOWED_HOSTS")
+    origins_env = os.getenv("MCP_ALLOWED_ORIGINS")
+    allowed_hosts = (
+        [h.strip() for h in hosts_env.split(",") if h.strip()]
+        if hosts_env else [f"{host}:{port}"]
+    )
+    allowed_origins = (
+        [o.strip() for o in origins_env.split(",") if o.strip()]
+        if origins_env else [f"http://{host}:{port}"]
+    )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
+class _BearerAuthMiddleware:
+    """Pure-ASGI middleware enforcing 'Authorization: Bearer <token>'.
+
+    Only installed when MCP_AUTH_TOKEN is set. This is the minimum access gate for
+    binding beyond loopback; fuller auth hardening is tracked on a separate
+    security/* branch. The token is read from the environment and never logged.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self._expected = f"Bearer {token}".encode("latin-1")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            headers = dict(scope.get("headers") or [])
+            provided = headers.get(b"authorization", b"")
+            if not hmac.compare_digest(provided, self._expected):
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"text/plain")],
+                })
+                await send({"type": "http.response.body", "body": b"Unauthorized"})
+                return
+        await self.app(scope, receive, send)
+
+
+def build_http_app(host: str, port: int, path: str):
+    """Build the Starlette ASGI app exposing the MCP endpoint over Streamable HTTP."""
+    import contextlib
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    security = _build_security_settings(host, port)
+    session_manager = StreamableHTTPSessionManager(app=server, security_settings=security)
+
+    async def handle_mcp(scope, receive, send):
+        await session_manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            logger.info("HA-MCP HTTP transport ready at http://%s:%s%s", host, port, path)
+            yield
+
+    app = Starlette(routes=[Mount(path, app=handle_mcp)], lifespan=lifespan)
+
+    if os.getenv("MCP_AUTH_TOKEN"):
+        app.add_middleware(_BearerAuthMiddleware, token=os.environ["MCP_AUTH_TOKEN"])
+        logger.info("Bearer-token auth enabled for HTTP transport")
+
+    return app
+
+
+def _enforce_exposure_gate(host: str) -> None:
+    """Refuse to expose HA control tools beyond this machine without explicit safeguards.
+
+    A non-loopback bind has two distinct failure modes, so we require an explicit
+    answer to both:
+      - MCP_AUTH_TOKEN: otherwise the 87 HA-control tools are reachable unauthenticated.
+      - MCP_ALLOWED_HOSTS: the auto-derived "host:port" default does not work for a
+        0.0.0.0 / all-interfaces bind (the Host header is the client-facing address,
+        not 0.0.0.0), so without this the server would reject every request anyway.
+    """
+    if _is_loopback(host):
+        return
+    missing = [
+        var for var in ("MCP_AUTH_TOKEN", "MCP_ALLOWED_HOSTS") if not os.getenv(var)
+    ]
+    if missing:
+        raise SystemExit(
+            f"Refusing to start: HTTP host '{host}' is not loopback, which exposes "
+            f"all Home Assistant control tools beyond this machine. Set "
+            f"{' and '.join(missing)} before binding to a non-loopback address."
+        )
+
+
+async def run_http(host: str, port: int, path: str) -> None:
+    """Run the MCP server over Streamable HTTP (multi-client; AI agents, Claude Code)."""
+    import uvicorn
+
+    config = uvicorn.Config(build_http_app(host, port, path), host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
 def cli() -> None:
     """Synchronous entry point for console_scripts / uvx."""
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="homeassistant-mcp",
+        description="Home Assistant MCP server (stdio or Streamable HTTP transport)",
+    )
+    parser.add_argument(
+        "--transport", choices=["stdio", "http"],
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="Transport to serve (default: stdio; env MCP_TRANSPORT)",
+    )
+    parser.add_argument("--host", default=None,
+                        help="HTTP bind host (env MCP_HTTP_HOST, default 127.0.0.1)")
+    parser.add_argument("--port", default=None,
+                        help="HTTP bind port (env MCP_HTTP_PORT, default 8787)")
+    parser.add_argument("--path", default=None,
+                        help="HTTP MCP endpoint path (env MCP_HTTP_PATH, default /mcp)")
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        host = args.host or os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+        port = int(args.port or os.getenv("MCP_HTTP_PORT", "8787"))
+        path = args.path or os.getenv("MCP_HTTP_PATH", "/mcp")
+        if not path.startswith("/"):
+            path = "/" + path
+        _enforce_exposure_gate(host)
+        asyncio.run(run_http(host, port, path))
+    else:
+        asyncio.run(run_stdio())
 
 
 if __name__ == "__main__":

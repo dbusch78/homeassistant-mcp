@@ -16,6 +16,14 @@ patch release. Changes relative to the upstream baseline are recorded under the
 ### Added
 - `CHANGELOG.md` following Keep a Changelog, tracking this fork's divergence from
   upstream.
+- Streamable HTTP transport (`--transport http`, env `MCP_TRANSPORT=http`)
+  alongside stdio, sharing the same tool handlers — for Claude Code and networked
+  AI agents. Configurable host/port/path (`MCP_HTTP_HOST`/`PORT`/`PATH`, default
+  `127.0.0.1:8787/mcp`). DNS-rebinding protection is always enabled with exact
+  host/origin allow-lists (overridable via `MCP_ALLOWED_HOSTS`/`MCP_ALLOWED_ORIGINS`);
+  a non-loopback bind refuses to start without `MCP_AUTH_TOKEN` and
+  `MCP_ALLOWED_HOSTS`; optional bearer-token auth via `MCP_AUTH_TOKEN`. Adds
+  `starlette`/`uvicorn` deps and raises the `mcp` floor to `>=1.27.0`.
 
 ### Changed
 - `.gitignore` now excludes `CLAUDE.md` so machine/network-specific deployment

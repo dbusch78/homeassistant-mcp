@@ -22,9 +22,15 @@ if [ -z "$HA_TOKEN" ]; then
     exit 1
 fi
 
-# Activate virtual environment and run server
-echo "🏠 Starting Home Assistant MCP Server..."
+# Activate virtual environment and run server.
+# start_server.sh is the multi-client entry point, so it defaults to the HTTP
+# transport; set MCP_TRANSPORT=stdio in .env to override. (start_mcp.sh stays stdio.)
+TRANSPORT="${MCP_TRANSPORT:-http}"
+echo "🏠 Starting Home Assistant MCP Server (${TRANSPORT} transport)..."
 echo "🔗 Connecting to: ${HA_URL:-http://homeassistant.local:8123}"
+if [ "$TRANSPORT" = "http" ]; then
+    echo "🌐 MCP endpoint: http://${MCP_HTTP_HOST:-127.0.0.1}:${MCP_HTTP_PORT:-8787}${MCP_HTTP_PATH:-/mcp}"
+fi
 
 source venv/bin/activate
-exec python server.py
+exec python server.py --transport "$TRANSPORT"
