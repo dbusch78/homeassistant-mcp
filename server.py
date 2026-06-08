@@ -37,6 +37,13 @@ from mcp.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("homeassistant-mcp")
 
+# aiohttp's default WebSocket max message size is 4 MiB, but Home Assistant
+# registry/state dumps (e.g. config/entity_registry/list) routinely exceed that on
+# larger installs and trip WSCloseCode.MESSAGE_TOO_BIG, breaking any tool that uses
+# the WS API (entity registry, areas-by-area, automations, etc.). Raise the cap.
+# Override via HA_WS_MAX_MSG_SIZE (bytes); 0 disables the limit entirely.
+WS_MAX_MSG_SIZE = int(os.getenv("HA_WS_MAX_MSG_SIZE", str(64 * 1024 * 1024)))
+
 def _paginate(
     items: list,
     search: Optional[str] = None,
@@ -120,7 +127,7 @@ class HomeAssistantClient:
             raise RuntimeError("Client not initialized. Use async context manager.")
 
         logger.info(f"Connecting WebSocket to {self._ws_url}")
-        self._ws = await self.session.ws_connect(self._ws_url)
+        self._ws = await self.session.ws_connect(self._ws_url, max_msg_size=WS_MAX_MSG_SIZE)
         self._ws_authenticated = False
         self._ws_id = 0
 
