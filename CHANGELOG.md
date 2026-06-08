@@ -51,6 +51,12 @@ patch release. Changes relative to the upstream baseline are recorded under the
   any value containing spaces or quotes; the new form sources them correctly.
 - README now states Python 3.10+ to match `pyproject.toml`'s `requires-python =
   ">=3.10"` (it claimed 3.11+; the code uses no 3.11-only features).
+- Area registry operations (`get_areas`, `create_area`, `update_area`,
+  `delete_area`) now use the WebSocket `config/area_registry/*` API. The previous
+  REST endpoint `/api/config/area_registry` returns 404 on modern HA (verified
+  against 2026.6) — the area registry is WebSocket-only, like the device and entity
+  registries. This also unblocks `get_area_entities`, which delegates to
+  `get_areas`.
 
 ## [1.0.0] — Fork baseline
 

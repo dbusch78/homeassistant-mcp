@@ -776,27 +776,32 @@ class HomeAssistantClient:
         return await self.call_service("script", "reload")
 
     # Area Management
+    #
+    # The area registry has no REST endpoint — /api/config/area_registry returns 404
+    # on modern HA (verified against 2026.6). It is WebSocket-only, like the device
+    # and entity registries, so all four operations go through config/area_registry/*
+    # WS commands (mirroring get_devices / get_entity_registry).
     async def get_areas(self) -> List[Dict[str, Any]]:
-        """Get all areas/zones"""
-        return await self._request("GET", "/api/config/area_registry")
-    
+        """Get all areas via the WebSocket area registry."""
+        return await self._ws_send_command({"type": "config/area_registry/list"})
+
     async def create_area(self, name: str, aliases: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Create a new area"""
-        data = {"name": name}
+        """Create a new area via the WebSocket area registry."""
+        cmd: Dict[str, Any] = {"type": "config/area_registry/create", "name": name}
         if aliases:
-            data["aliases"] = aliases
-        return await self._request("POST", "/api/config/area_registry", json=data)
-    
+            cmd["aliases"] = aliases
+        return await self._ws_send_command(cmd)
+
     async def update_area(self, area_id: str, name: str, aliases: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Update an existing area"""
-        data = {"name": name}
+        """Update an existing area via the WebSocket area registry."""
+        cmd: Dict[str, Any] = {"type": "config/area_registry/update", "area_id": area_id, "name": name}
         if aliases:
-            data["aliases"] = aliases
-        return await self._request("POST", f"/api/config/area_registry/{area_id}", json=data)
-    
+            cmd["aliases"] = aliases
+        return await self._ws_send_command(cmd)
+
     async def delete_area(self, area_id: str) -> Dict[str, Any]:
-        """Delete an area"""
-        return await self._request("DELETE", f"/api/config/area_registry/{area_id}")
+        """Delete an area via the WebSocket area registry."""
+        return await self._ws_send_command({"type": "config/area_registry/delete", "area_id": area_id})
     
     # Device Management
     async def get_devices(self, search: Optional[str] = None, offset: int = 0, limit: int = 0) -> Dict[str, Any]:
