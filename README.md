@@ -47,10 +47,17 @@ HA_TOKEN=your_long_lived_access_token_here
 
 ## Usage
 
+### Transports
+
+The server speaks two MCP transports from the same 87 tools:
+
+- **stdio** (default) — `python server.py`. Used by Claude Desktop and `start_mcp.sh`; the client launches the server as a subprocess.
+- **Streamable HTTP** — `python server.py --transport http`. A long-running multi-client endpoint for Claude Code and networked AI agents.
+
 ### Start the server
 
 ```bash
-./start_server.sh
+./start_server.sh          # multi-client HTTP transport (default)
 ```
 
 Or directly:
@@ -58,7 +65,37 @@ Or directly:
 ```bash
 export HA_URL=http://homeassistant.local:8123
 export HA_TOKEN=your_token
-python server.py
+
+python server.py                       # stdio (default)
+python server.py --transport http      # Streamable HTTP on 127.0.0.1:8787/mcp
+```
+
+### HTTP transport (Claude Code & AI agents)
+
+Configurable via env (or `--host`/`--port`/`--path`):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_TRANSPORT` | `stdio` | `http` to serve over HTTP |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Bind host |
+| `MCP_HTTP_PORT` | `8787` | Bind port |
+| `MCP_HTTP_PATH` | `/mcp` | Endpoint path |
+| `MCP_ALLOWED_HOSTS` | `<host>:<port>` | Allowed `Host` headers (DNS-rebinding protection) |
+| `MCP_ALLOWED_ORIGINS` | `http://<host>:<port>` | Allowed `Origin` headers |
+| `MCP_AUTH_TOKEN` | _unset_ | Require `Authorization: Bearer <token>` |
+
+**Security model (read before exposing beyond localhost):**
+
+- DNS-rebinding protection is always on. By default only the **exact** bind address is allowed — so `http://localhost:8787` is **rejected (HTTP 421)** on a `127.0.0.1` bind because `Host: localhost:8787 ≠ 127.0.0.1:8787`. Connect via the IP, or add `localhost:8787` to `MCP_ALLOWED_HOSTS`.
+- A **non-loopback bind refuses to start** unless both `MCP_AUTH_TOKEN` and `MCP_ALLOWED_HOSTS` are set, so a stray `MCP_HTTP_HOST=0.0.0.0` can't silently expose Home Assistant control.
+
+Register the running server in **Claude Code**:
+
+```bash
+claude mcp add --transport http homeassistant http://127.0.0.1:8787/mcp
+# with a token:
+claude mcp add --transport http homeassistant http://127.0.0.1:8787/mcp \
+  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
 ```
 
 ### Claude Desktop
