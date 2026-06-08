@@ -57,6 +57,11 @@ patch release. Changes relative to the upstream baseline are recorded under the
   against 2026.6) — the area registry is WebSocket-only, like the device and entity
   registries. This also unblocks `get_area_entities`, which delegates to
   `get_areas`.
+- WebSocket connections now raise aiohttp's max message size to 64 MiB
+  (configurable via `HA_WS_MAX_MSG_SIZE`, `0` = unlimited). The 4 MiB default
+  tripped `WSCloseCode.MESSAGE_TOO_BIG` on large registry dumps — on this instance
+  `config/entity_registry/list` is ~6.5 MB (10,901 entities) — breaking every
+  WS-backed tool (entity registry, areas-by-area, automations, …).
 
 ## [1.0.0] — Fork baseline
 
