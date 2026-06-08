@@ -62,6 +62,10 @@ patch release. Changes relative to the upstream baseline are recorded under the
   tripped `WSCloseCode.MESSAGE_TOO_BIG` on large registry dumps — on this instance
   `config/entity_registry/list` is ~6.5 MB (10,901 entities) — breaking every
   WS-backed tool (entity registry, areas-by-area, automations, …).
+- `tests/test_mcp_tools.py` no longer fails tools whose schema omits the optional
+  JSON Schema `required` key (a tool with no mandatory params correctly omits it).
+  The check now validates `required` only when present — it must be a list naming
+  declared properties.
 
 ## [1.0.0] — Fork baseline
 
