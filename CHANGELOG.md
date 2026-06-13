@@ -32,6 +32,15 @@ patch release. Changes relative to the upstream baseline are recorded under the
   Configurable via `MCP_RATE_LIMIT_RPM` (default 120) and `MCP_RATE_LIMIT_BURST`
   (default 20); over-limit calls return `{"error": "rate_limited",
   "retry_after_seconds": N}` without contacting Home Assistant.
+- Input validation on service-call tools, run before any Home Assistant request.
+  CLAUDE.md required input sanitization on service-call tools, but none existed.
+  This is net-new: identifiers interpolated into HA REST paths (`domain`,
+  `service`, `event_type`, `entity_id`, automation/script config ids) are
+  validated against HA's own grammar — blocking `/`, `..`, and control chars
+  that could escape the intended endpoint — and free-form payloads are bounded
+  (nesting depth, string length, NUL bytes). Invalid input returns
+  `{"error": "validation_failed", ...}` instead of reaching HA. Read-only tools
+  are unconstrained; validation never rejects a call HA would have accepted.
 
 ### Changed
 - `.gitignore` now excludes `CLAUDE.md` so machine/network-specific deployment

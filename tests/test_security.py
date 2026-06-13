@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Tests for the security middleware layer (security/rate-limiting-validation):
-  - RateLimiter token bucket (burst, exhaustion, refill, isolation).
+  - RateLimiter token bucket (burst, exhaustion, refill, isolation),
+  - validate_tool_input grammar + payload caps (rejects injection, accepts valid).
 
 No live Home Assistant required: everything exercises the middleware layer
 directly with a deterministic injected clock.
@@ -13,7 +14,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server
-from server import RateLimiter, RateLimitExceeded
+from server import (
+    RateLimiter,
+    RateLimitExceeded,
+    ToolInputError,
+    validate_tool_input,
+)
 
 
 # --- rate limiter ------------------------------------------------------------
@@ -87,9 +93,99 @@ def test_rate_limiter_rejects_bad_config():
             raise AssertionError(f"RateLimiter{bad} should reject non-positive config")
 
 
+# --- input validation: rejects injection / malformed -------------------------
+
+def _expect_reject(name, args, field=None):
+    try:
+        validate_tool_input(name, args)
+    except ToolInputError as e:
+        if field is not None:
+            assert e.field == field, f"{name}: expected field {field}, got {e.field}"
+    else:
+        raise AssertionError(f"{name} {args} should have been rejected")
+
+
+def test_validation_rejects_path_injection():
+    # domain/service/event_type are interpolated into the REST path.
+    _expect_reject("call_service", {"domain": "../../admin", "service": "x"}, "domain")
+    _expect_reject("call_service", {"domain": "light", "service": "turn_on/../"}, "service")
+    _expect_reject("fire_event", {"event_type": "a/b"}, "event_type")
+    # config ids must not carry path separators.
+    _expect_reject("update_automation", {"automation_id": "../secrets"}, "automation_id")
+    _expect_reject("delete_script", {"script_id": "a/b"}, "script_id")
+
+
+def test_validation_rejects_bad_entity_id():
+    _expect_reject("get_entity_state", {"entity_id": "no_dot_here"}, "entity_id")
+    _expect_reject("get_entity_state", {"entity_id": "light./etc/passwd"}, "entity_id")
+    _expect_reject("set_state", {"entity_id": "Light.Kitchen", "state": "on"}, "entity_id")
+    _expect_reject("delete_state", {"entity_id": "../x"}, "entity_id")
+
+
+def test_validation_rejects_missing_required():
+    _expect_reject("get_entity_state", {}, "entity_id")
+    _expect_reject("call_service", {"domain": "light"}, "service")
+
+
+def test_validation_rejects_payload_abuse():
+    obj = {}
+    cur = obj
+    for _ in range(server.MAX_PAYLOAD_DEPTH + 2):
+        cur["k"] = {}
+        cur = cur["k"]
+    _expect_reject("call_service",
+                   {"domain": "light", "service": "turn_on", "service_data": obj},
+                   "service_data")
+    _expect_reject("set_state",
+                   {"entity_id": "sensor.x", "state": "ok", "attributes": {"a": "y\x00z"}},
+                   "attributes")
+    _expect_reject("render_template",
+                   {"template": "x" * (server.MAX_TEMPLATE_LEN + 1)},
+                   "template")
+    _expect_reject("set_state",
+                   {"entity_id": "sensor.x", "state": "n\x00ul"},
+                   "state")
+
+
+# --- input validation: accepts valid calls (no false rejects) ----------------
+
+def _expect_ok(name, args):
+    validate_tool_input(name, args)   # must not raise
+
+
+def test_validation_accepts_valid_calls():
+    _expect_ok("call_service", {"domain": "light", "service": "turn_on",
+                                "entity_id": "light.kitchen"})
+    # entity_id as a list target is valid (goes into the body, not a path).
+    _expect_ok("call_service", {"domain": "light", "service": "turn_on",
+                                "entity_id": ["light.a", "light.b"]})
+    _expect_ok("get_entity_state", {"entity_id": "binary_sensor.front_door"})
+    _expect_ok("set_state", {"entity_id": "sensor.x", "state": "42",
+                             "attributes": {"unit": "W"}})
+    _expect_ok("fire_event", {"event_type": "my_custom_event", "event_data": {"a": 1}})
+    _expect_ok("render_template", {"template": "{{ states('sensor.x') }}"})
+    # toggle uses an entity_id; update uses a numeric config id.
+    _expect_ok("toggle_automation", {"automation_id": "automation.morning"})
+    _expect_ok("update_automation", {"automation_id": "1718294827361",
+                                     "config": {"alias": "x", "action": []}})
+    _expect_ok("delete_automation", {"automation_id": "1718294827361"})
+
+
+def test_validation_ignores_unlisted_tools():
+    # A read-only tool not in the spec table is never constrained.
+    validate_tool_input("get_system_info", {"anything": "../etc", "x": "\x00"})
+    validate_tool_input("search_entities", {"query": "kitchen/../"})
+
+
 if __name__ == "__main__":
     test_rate_limiter_allows_burst_then_blocks()
     test_rate_limiter_refills_over_time()
     test_rate_limiter_isolates_clients()
     test_rate_limiter_rejects_bad_config()
-    print("OK: rate limiting tests pass")
+    test_validation_rejects_path_injection()
+    test_validation_rejects_bad_entity_id()
+    test_validation_rejects_missing_required()
+    test_validation_rejects_payload_abuse()
+    test_validation_accepts_valid_calls()
+    test_validation_ignores_unlisted_tools()
+    print("OK: rate limiting + input validation tests pass")
