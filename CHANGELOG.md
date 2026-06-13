@@ -31,6 +31,13 @@ patch release. Changes relative to the upstream baseline are recorded under the
   fork.
 
 ### Fixed
+- HTTP transport now serves both `/mcp` and `/mcp/` with a `200` directly, instead
+  of `307`-redirecting the bare path to the trailing-slash form. The single
+  Starlette `Mount("/mcp", ...)` issued that redirect at the routing layer, costing
+  an extra POST round-trip per call and tripping Claude Code's `/doctor` setup
+  warning. The endpoint is now registered as two explicit `Route`s pointing at one
+  pure-ASGI handler (so every method — POST/GET/DELETE — passes through). Bearer
+  auth and DNS-rebinding protection are unchanged and verified live on both paths.
 - Remove duplicate `restart_homeassistant` tool definition. The tool was declared
   twice in `handle_list_tools` (upstream bug), so the server advertised 88 tool
   entries for 87 distinct tools; some MCP clients reject duplicate tool names.

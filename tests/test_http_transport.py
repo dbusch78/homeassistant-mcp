@@ -126,16 +126,17 @@ def test_http_initialize_and_list_tools():
                 tools = await session.list_tools()
                 return [t.name for t in tools.tools]
 
-    def _forged_host_status() -> int:
+    def _forged_host_status(target_path: str) -> int:
         # Real TCP connection to the bound port, but a spoofed Host header — the
         # exact shape of a DNS-rebinding attack. Must be rejected (421), proving
         # protection is live and not merely configured.
         import http.client
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-        # Hit the mounted endpoint directly (/mcp/) — /mcp 307-redirects to it at
-        # the routing layer, before the transport security middleware runs.
+        # Both "/mcp" and "/mcp/" are registered as explicit Routes that serve 200
+        # directly (no 307 redirect), so the transport security middleware runs on
+        # the bare path too. Exercise the given form to prove that.
         conn.request(
-            "POST", "/mcp/",
+            "POST", target_path,
             body=b"{}",
             headers={
                 "Host": "evil.attacker.example",
@@ -149,7 +150,8 @@ def test_http_initialize_and_list_tools():
 
     try:
         names = asyncio.run(_exercise())
-        forged_status = _forged_host_status()
+        forged_status_bare = _forged_host_status("/mcp")
+        forged_status_slash = _forged_host_status("/mcp/")
     finally:
         uv.should_exit = True
         thread.join(timeout=10)
@@ -159,8 +161,10 @@ def test_http_initialize_and_list_tools():
     # No duplicates, and the full surface is advertised over HTTP.
     assert len(names) == len(set(names)), "duplicate tool names over HTTP"
     assert len(names) >= 80, f"expected the full tool set, got {len(names)}"
-    # DNS-rebinding protection actively rejects a spoofed Host header.
-    assert forged_status == 421, f"forged Host should be rejected with 421, got {forged_status}"
+    # DNS-rebinding protection actively rejects a spoofed Host header on BOTH the
+    # bare path and its trailing-slash form (neither redirects away first).
+    assert forged_status_bare == 421, f"forged Host on /mcp should be 421, got {forged_status_bare}"
+    assert forged_status_slash == 421, f"forged Host on /mcp/ should be 421, got {forged_status_slash}"
 
 
 if __name__ == "__main__":

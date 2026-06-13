@@ -3366,14 +3366,23 @@ def build_http_app(host: str, port: int, path: str):
     import contextlib
 
     from starlette.applications import Starlette
-    from starlette.routing import Mount
+    from starlette.routing import Route
     from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
     security = _build_security_settings(host, port)
     session_manager = StreamableHTTPSessionManager(app=server, security_settings=security)
 
-    async def handle_mcp(scope, receive, send):
-        await session_manager.handle_request(scope, receive, send)
+    class _MCPEndpoint:
+        """Pure-ASGI endpoint delegating to the Streamable HTTP session manager.
+
+        A class instance (not a function/method) so Starlette's Route mounts it as
+        a raw ASGI app and passes every method (GET for the SSE stream, POST for
+        messages, DELETE for session teardown) straight through, instead of
+        wrapping it as a request/response handler limited to GET.
+        """
+
+        async def __call__(self, scope, receive, send):
+            await session_manager.handle_request(scope, receive, send)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app):
@@ -3381,7 +3390,17 @@ def build_http_app(host: str, port: int, path: str):
             logger.info("HA-MCP HTTP transport ready at http://%s:%s%s", host, port, path)
             yield
 
-    app = Starlette(routes=[Mount(path, app=handle_mcp)], lifespan=lifespan)
+    # Register the endpoint at BOTH the bare path and its trailing-slash form so
+    # each returns 200 directly. A single Starlette Mount("/mcp", ...) 307-redirects
+    # "/mcp" -> "/mcp/" at the routing layer, which is an extra POST round-trip and
+    # the source of Claude Code's "/doctor" setting warning. Two explicit Routes
+    # both match exactly, so neither path redirects.
+    endpoint = _MCPEndpoint()
+    bare = "/" + path.strip("/")
+    app = Starlette(
+        routes=[Route(bare, endpoint), Route(bare + "/", endpoint)],
+        lifespan=lifespan,
+    )
 
     if os.getenv("MCP_AUTH_TOKEN"):
         app.add_middleware(_BearerAuthMiddleware, token=os.environ["MCP_AUTH_TOKEN"])
