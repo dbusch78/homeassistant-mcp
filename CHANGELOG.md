@@ -84,6 +84,12 @@ patch release. Changes relative to the upstream baseline are recorded under the
   The check now validates `required` only when present — it must be a list naming
   declared properties.
 
+### Security
+- Non-loopback exposure gate now treats a whitespace-only `MCP_AUTH_TOKEN` or
+  `MCP_ALLOWED_HOSTS` as missing (`os.getenv(var, "").strip()`), closing a gap
+  where e.g. `MCP_AUTH_TOKEN="   "` satisfied the gate while being effectively
+  empty, allowing an unauthenticated non-loopback bind.
+
 ## [1.0.0] — Fork baseline
 
 Initial fork of `maximeallanic/homeassistant-mcp`. Subsequent fixes, security work,

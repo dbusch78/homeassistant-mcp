@@ -91,7 +91,7 @@ Configurable via env (or `--host`/`--port`/`--path`):
 - **Rate limiting** is always on, on **every** tool call over both transports. Each client gets a token bucket — `MCP_RATE_LIMIT_BURST` calls instantly, refilling to `MCP_RATE_LIMIT_RPM`/min. Over-limit calls return `{"error": "rate_limited", "retry_after_seconds": N}` without touching Home Assistant. Clients are keyed per MCP session (HTTP) or per process (stdio).
 - **Input validation** runs on service-call tools before any HA request. Identifiers interpolated into HA REST paths (`domain`, `service`, `event_type`, `entity_id`, automation/script ids) are checked against HA's own grammar, and free-form payloads are bounded — so a value with `/`, `..`, a NUL byte, or pathological nesting is rejected with `{"error": "validation_failed", ...}` rather than reaching HA.
 - DNS-rebinding protection is always on. By default only the **exact** bind address is allowed — so `http://localhost:8787` is **rejected (HTTP 421)** on a `127.0.0.1` bind because `Host: localhost:8787 ≠ 127.0.0.1:8787`. Connect via the IP, or add `localhost:8787` to `MCP_ALLOWED_HOSTS`.
-- A **non-loopback bind refuses to start** unless both `MCP_AUTH_TOKEN` and `MCP_ALLOWED_HOSTS` are set, so a stray `MCP_HTTP_HOST=0.0.0.0` can't silently expose Home Assistant control.
+- A **non-loopback bind refuses to start** unless both `MCP_AUTH_TOKEN` and `MCP_ALLOWED_HOSTS` are set (whitespace-only values don't count), so a stray `MCP_HTTP_HOST=0.0.0.0` can't silently expose Home Assistant control.
 
 Register the running server in **Claude Code**:
 

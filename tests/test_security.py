@@ -177,6 +177,23 @@ def test_validation_ignores_unlisted_tools():
     validate_tool_input("search_entities", {"query": "kitchen/../"})
 
 
+# --- exposure gate whitespace fix --------------------------------------------
+
+def test_exposure_gate_rejects_whitespace_token():
+    os.environ["MCP_AUTH_TOKEN"] = "   "          # effectively empty
+    os.environ["MCP_ALLOWED_HOSTS"] = "172.21.30.5:8787"
+    try:
+        server._enforce_exposure_gate("172.21.30.5")
+    except SystemExit as e:
+        assert "MCP_AUTH_TOKEN" in str(e), str(e)
+        assert "MCP_ALLOWED_HOSTS" not in str(e), str(e)
+    else:
+        raise AssertionError("whitespace-only MCP_AUTH_TOKEN must not satisfy the gate")
+    finally:
+        os.environ.pop("MCP_AUTH_TOKEN", None)
+        os.environ.pop("MCP_ALLOWED_HOSTS", None)
+
+
 if __name__ == "__main__":
     test_rate_limiter_allows_burst_then_blocks()
     test_rate_limiter_refills_over_time()
@@ -188,4 +205,5 @@ if __name__ == "__main__":
     test_validation_rejects_payload_abuse()
     test_validation_accepts_valid_calls()
     test_validation_ignores_unlisted_tools()
-    print("OK: rate limiting + input validation tests pass")
+    test_exposure_gate_rejects_whitespace_token()
+    print("OK: rate limiting + input validation + exposure-gate tests pass")

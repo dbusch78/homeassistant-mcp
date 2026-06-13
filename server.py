@@ -3647,8 +3647,11 @@ def _enforce_exposure_gate(host: str) -> None:
     """
     if _is_loopback(host):
         return
+    # .strip() so a whitespace-only value (e.g. MCP_AUTH_TOKEN="   ") counts as
+    # missing rather than satisfying the gate while being effectively empty.
     missing = [
-        var for var in ("MCP_AUTH_TOKEN", "MCP_ALLOWED_HOSTS") if not os.getenv(var)
+        var for var in ("MCP_AUTH_TOKEN", "MCP_ALLOWED_HOSTS")
+        if not os.getenv(var, "").strip()
     ]
     if missing:
         raise SystemExit(
