@@ -48,6 +48,12 @@ patch release. Changes relative to the upstream baseline are recorded under the
   (e.g. `timer.finished`) and customs may use hyphens — a live audit of the
   instance confirmed dotted event types are in use, which a strict slug pattern
   would have wrongly rejected.
+- `SECURITY.md` documenting the security model (transport hardening, rate
+  limiting, input validation, the two-tier tool model, secrets handling) and the
+  private vulnerability-reporting process.
+- `CONTRIBUTING.md` covering development setup, branching strategy, commit
+  standards, the PR workflow (including the documentation-currency requirement),
+  how to add a tool, testing, and versioning.
 
 ### Changed
 - `.gitignore` now excludes `CLAUDE.md` so machine/network-specific deployment
