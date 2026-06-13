@@ -89,6 +89,10 @@ patch release. Changes relative to the upstream baseline are recorded under the
   `MCP_ALLOWED_HOSTS` as missing (`os.getenv(var, "").strip()`), closing a gap
   where e.g. `MCP_AUTH_TOKEN="   "` satisfied the gate while being effectively
   empty, allowing an unauthenticated non-loopback bind.
+- Bearer-auth middleware now denies non-`http` client scopes instead of passing
+  them through. Previously it only checked `Authorization` on `http` scopes, so a
+  `websocket` scope would bypass auth entirely. No WebSocket routes are mounted
+  today, so this is fail-closed hardening for when SSE/WS transports are added.
 
 ## [1.0.0] — Fork baseline
 

@@ -2,12 +2,15 @@
 """
 Tests for the security middleware layer (security/rate-limiting-validation):
   - RateLimiter token bucket (burst, exhaustion, refill, isolation),
-  - validate_tool_input grammar + payload caps (rejects injection, accepts valid).
+  - validate_tool_input grammar + payload caps (rejects injection, accepts valid),
+  - the exposure-gate whitespace fix,
+  - the _BearerAuthMiddleware non-http scope guard.
 
 No live Home Assistant required: everything exercises the middleware layer
-directly with a deterministic injected clock.
+directly with a deterministic injected clock and fake ASGI scopes.
 """
 
+import asyncio
 import os
 import sys
 
@@ -194,6 +197,53 @@ def test_exposure_gate_rejects_whitespace_token():
         os.environ.pop("MCP_ALLOWED_HOSTS", None)
 
 
+# --- bearer middleware scope guard -------------------------------------------
+
+async def _drive(mw, scope):
+    """Run the middleware against a scope; return (forwarded, sent_messages)."""
+    sent = []
+    forwarded = {"called": False}
+
+    async def app(s, r, sd):
+        forwarded["called"] = True
+
+    async def receive():
+        return {"type": "noop"}
+
+    async def send(msg):
+        sent.append(msg)
+
+    mw.app = app
+    await mw.__call__(scope, receive, send)
+    return forwarded["called"], sent
+
+
+def test_bearer_guard_blocks_websocket():
+    mw = server._BearerAuthMiddleware(app=None, token="t")
+    forwarded, sent = asyncio.run(_drive(mw, {"type": "websocket", "headers": []}))
+    assert not forwarded, "websocket must not reach the app (no auth path)"
+    assert any(m.get("type") == "websocket.close" for m in sent), sent
+
+
+def test_bearer_guard_passes_lifespan():
+    mw = server._BearerAuthMiddleware(app=None, token="t")
+    forwarded, _ = asyncio.run(_drive(mw, {"type": "lifespan"}))
+    assert forwarded, "lifespan is the server lifecycle and must pass through"
+
+
+def test_bearer_guard_http_enforced():
+    mw = server._BearerAuthMiddleware(app=None, token="sekret")
+    # Bad token -> 401, not forwarded.
+    bad_scope = {"type": "http", "headers": [(b"authorization", b"Bearer nope")]}
+    forwarded, sent = asyncio.run(_drive(mw, bad_scope))
+    assert not forwarded
+    assert sent[0]["status"] == 401, sent
+    # Good token -> forwarded.
+    good_scope = {"type": "http", "headers": [(b"authorization", b"Bearer sekret")]}
+    forwarded, _ = asyncio.run(_drive(mw, good_scope))
+    assert forwarded
+
+
 if __name__ == "__main__":
     test_rate_limiter_allows_burst_then_blocks()
     test_rate_limiter_refills_over_time()
@@ -206,4 +256,7 @@ if __name__ == "__main__":
     test_validation_accepts_valid_calls()
     test_validation_ignores_unlisted_tools()
     test_exposure_gate_rejects_whitespace_token()
-    print("OK: rate limiting + input validation + exposure-gate tests pass")
+    test_bearer_guard_blocks_websocket()
+    test_bearer_guard_passes_lifespan()
+    test_bearer_guard_http_enforced()
+    print("OK: rate limiting, input validation, exposure-gate, and scope-guard all pass")

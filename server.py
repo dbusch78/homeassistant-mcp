@@ -3592,7 +3592,8 @@ class _BearerAuthMiddleware:
         self._expected = f"Bearer {token}".encode("latin-1")
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        stype = scope.get("type")
+        if stype == "http":
             headers = dict(scope.get("headers") or [])
             provided = headers.get(b"authorization", b"")
             if not hmac.compare_digest(provided, self._expected):
@@ -3603,6 +3604,17 @@ class _BearerAuthMiddleware:
                 })
                 await send({"type": "http.response.body", "body": b"Unauthorized"})
                 return
+        elif stype == "websocket":
+            # No bearer-check path exists for websockets here, so refuse the
+            # handshake rather than let it bypass auth. No WS routes are mounted
+            # today; this is fail-closed for when SSE/WS transports are added.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        elif stype != "lifespan":
+            # lifespan is the server lifecycle, not a client request — pass it
+            # through. Any other (unknown) client scope is denied by not
+            # forwarding it to the app.
+            return
         await self.app(scope, receive, send)
 
 
