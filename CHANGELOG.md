@@ -24,6 +24,23 @@ patch release. Changes relative to the upstream baseline are recorded under the
   a non-loopback bind refuses to start without `MCP_AUTH_TOKEN` and
   `MCP_ALLOWED_HOSTS`; optional bearer-token auth via `MCP_AUTH_TOKEN`. Adds
   `starlette`/`uvicorn` deps and raises the `mcp` floor to `>=1.27.0`.
+- Per-client rate limiting on every tool call, across both transports. CLAUDE.md
+  listed rate limiting as a standing requirement ("must remain enabled"), but it
+  was never actually wired to the tool path — the only limiter lived on the
+  unused SSE manager. This is net-new: a token-bucket limiter at the single
+  tool-call chokepoint, keyed per MCP session (HTTP) or per process (stdio).
+  Configurable via `MCP_RATE_LIMIT_RPM` (default 120) and `MCP_RATE_LIMIT_BURST`
+  (default 20); over-limit calls return `{"error": "rate_limited",
+  "retry_after_seconds": N}` without contacting Home Assistant.
+- Input validation on service-call tools, run before any Home Assistant request.
+  CLAUDE.md required input sanitization on service-call tools, but none existed.
+  This is net-new: identifiers interpolated into HA REST paths (`domain`,
+  `service`, `event_type`, `entity_id`, automation/script config ids) are
+  validated against HA's own grammar — blocking `/`, `..`, and control chars
+  that could escape the intended endpoint — and free-form payloads are bounded
+  (nesting depth, string length, NUL bytes). Invalid input returns
+  `{"error": "validation_failed", ...}` instead of reaching HA. Read-only tools
+  are unconstrained; validation never rejects a call HA would have accepted.
 
 ### Changed
 - `.gitignore` now excludes `CLAUDE.md` so machine/network-specific deployment
@@ -73,6 +90,16 @@ patch release. Changes relative to the upstream baseline are recorded under the
   JSON Schema `required` key (a tool with no mandatory params correctly omits it).
   The check now validates `required` only when present — it must be a list naming
   declared properties.
+
+### Security
+- Non-loopback exposure gate now treats a whitespace-only `MCP_AUTH_TOKEN` or
+  `MCP_ALLOWED_HOSTS` as missing (`os.getenv(var, "").strip()`), closing a gap
+  where e.g. `MCP_AUTH_TOKEN="   "` satisfied the gate while being effectively
+  empty, allowing an unauthenticated non-loopback bind.
+- Bearer-auth middleware now denies non-`http` client scopes instead of passing
+  them through. Previously it only checked `Authorization` on `http` scopes, so a
+  `websocket` scope would bypass auth entirely. No WebSocket routes are mounted
+  today, so this is fail-closed hardening for when SSE/WS transports are added.
 
 ## [1.0.0] — Fork baseline
 

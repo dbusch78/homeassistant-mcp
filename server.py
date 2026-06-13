@@ -15,6 +15,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import uuid
 import time
 from typing import Any, Dict, List, Optional, Union, Set
@@ -1227,6 +1228,232 @@ HA_TOKEN = os.getenv("HA_TOKEN", "")
 
 if not HA_TOKEN:
     logger.warning("HA_TOKEN not set. You'll need to provide it via environment variable.")
+
+
+# ---------------------------------------------------------------------------
+# Security middleware layer
+#
+# CLAUDE.md requires per-call rate limiting and input sanitization on service
+# calls. Both were declared requirements but never wired to the tool path; this
+# adds them. Everything here runs at the single tool-call chokepoint
+# (handle_call_tool), so it covers all tools over both transports (stdio + HTTP)
+# without changing any individual tool's logic.
+# ---------------------------------------------------------------------------
+
+# Token-bucket limits, env-configurable. Defaults are generous enough not to
+# impede interactive Claude Code bursts, but cap a runaway agent loop hammering
+# the (resource-constrained) Home Assistant box.
+RATE_LIMIT_RPM = int(os.getenv("MCP_RATE_LIMIT_RPM", "120"))
+RATE_LIMIT_BURST = int(os.getenv("MCP_RATE_LIMIT_BURST", "20"))
+
+
+class RateLimitExceeded(Exception):
+    """Raised when a client exceeds its tool-call token bucket."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"rate limit exceeded; retry after {retry_after:.1f}s")
+
+
+class RateLimiter:
+    """Per-client token-bucket rate limiter for tool calls.
+
+    capacity = burst (calls available instantly); the bucket refills at rpm/60
+    tokens per second up to capacity. A call consumes one token; an empty bucket
+    raises RateLimitExceeded with the seconds until the next token is available.
+
+    Buckets are keyed by client id (see _client_id): one per stdio process, one
+    per HTTP session. State is in-process only — correct for this single-process
+    server; a multi-process deployment would need shared state. A monotonic clock
+    is injected so tests can advance time deterministically.
+    """
+
+    def __init__(self, rpm: int = RATE_LIMIT_RPM, burst: int = RATE_LIMIT_BURST,
+                 time_fn=time.monotonic):
+        if rpm <= 0 or burst <= 0:
+            raise ValueError("rpm and burst must both be positive")
+        self._rate = rpm / 60.0            # tokens per second
+        self._capacity = float(burst)
+        self._time = time_fn
+        self._buckets: Dict[str, tuple] = {}   # client_id -> (tokens, last_ts)
+
+    def check(self, client_id: str) -> None:
+        """Consume one token for client_id, or raise RateLimitExceeded."""
+        now = self._time()
+        tokens, last = self._buckets.get(client_id, (self._capacity, now))
+        # Refill for elapsed time, capped at capacity.
+        tokens = min(self._capacity, tokens + (now - last) * self._rate)
+        if tokens < 1.0:
+            # Persist the refill so elapsed time still counts toward the next token.
+            self._buckets[client_id] = (tokens, now)
+            raise RateLimitExceeded((1.0 - tokens) / self._rate)
+        self._buckets[client_id] = (tokens - 1.0, now)
+
+
+rate_limiter = RateLimiter()
+
+
+def _client_id() -> str:
+    """Identify the calling client for rate limiting.
+
+    - stdio: a single connected process -> constant "stdio".
+    - HTTP: the per-connection MCP session id when present (the client echoes
+      Mcp-Session-Id on every call), else the remote address.
+
+    Falls back to a per-transport constant if no finer id is reachable, so a
+    missing id can never disable rate limiting (fail onto a shared bucket, never
+    fail open).
+    """
+    try:
+        ctx = server.request_context
+    except (LookupError, AttributeError):
+        return "stdio"          # no active request context (e.g. direct call)
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return "stdio"          # stdio transport carries no HTTP request
+    try:
+        sid = request.headers.get("mcp-session-id")
+        if sid:
+            return f"http:{sid}"
+        client = getattr(request, "client", None)
+        if client and getattr(client, "host", None):
+            return f"http:{client.host}"
+    except AttributeError:
+        pass
+    return "http"               # fail-closed onto a shared HTTP bucket
+
+
+# --- service-call input validation -------------------------------------------
+#
+# These identifiers are interpolated directly into Home Assistant REST paths
+# (e.g. /api/services/{domain}/{service}, /api/states/{entity_id},
+# /api/config/automation/config/{id}), so a value containing "/", ".." or a
+# control char could escape the intended endpoint. Validate before any HA call.
+# The grammars below are exactly what HA itself accepts, so validation can never
+# reject a call HA would have honored — it only blocks malformed/injecting input.
+_SLUG_RE = re.compile(r"^[a-z0-9_]+$")              # domain / service / event_type
+_ENTITY_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")   # <domain>.<object_id>
+_CONFIG_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")     # automation/script config id (path-safe)
+
+# Generous structural caps on free-form payloads — meant to stop pathological
+# nesting and NUL/control injection, not to second-guess large but legitimate
+# automation or dashboard configs.
+MAX_STRING_LEN = 64 * 1024
+MAX_TEMPLATE_LEN = 64 * 1024
+MAX_PAYLOAD_DEPTH = 32
+
+
+class ToolInputError(Exception):
+    """Raised when a tool's arguments fail validation before reaching HA."""
+
+    def __init__(self, field: str, reason: str):
+        self.field = field
+        self.reason = reason
+        super().__init__(f"{field}: {reason}")
+
+
+def _check_payload(value: Any, field: str, depth: int = 0) -> None:
+    """Bound a free-form JSON payload: nesting depth, string length, no NUL."""
+    if depth > MAX_PAYLOAD_DEPTH:
+        raise ToolInputError(field, f"nested deeper than {MAX_PAYLOAD_DEPTH} levels")
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise ToolInputError(field, "contains a NUL byte")
+        if len(value) > MAX_STRING_LEN:
+            raise ToolInputError(field, f"string exceeds {MAX_STRING_LEN} chars")
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ToolInputError(field, "object keys must be strings")
+            _check_payload(k, field, depth + 1)
+            _check_payload(v, field, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_payload(item, field, depth + 1)
+    # numbers / bool / None: nothing to bound.
+
+
+def _check_field(kind: str, value: Any, field: str) -> None:
+    if kind == "slug":
+        if not isinstance(value, str) or not _SLUG_RE.match(value):
+            raise ToolInputError(field, "must be a lowercase identifier [a-z0-9_]")
+    elif kind == "entity_id":
+        if not isinstance(value, str) or not _ENTITY_ID_RE.match(value):
+            raise ToolInputError(field, "must be a valid entity_id '<domain>.<object_id>'")
+    elif kind == "config_id":
+        if not isinstance(value, str) or not _CONFIG_ID_RE.match(value):
+            raise ToolInputError(field, "must match [A-Za-z0-9_-] (no path separators)")
+    elif kind == "string":
+        if not isinstance(value, str):
+            raise ToolInputError(field, "must be a string")
+        if "\x00" in value:
+            raise ToolInputError(field, "contains a NUL byte")
+        if len(value) > MAX_STRING_LEN:
+            raise ToolInputError(field, f"exceeds {MAX_STRING_LEN} chars")
+    elif kind == "template":
+        if not isinstance(value, str):
+            raise ToolInputError(field, "must be a string")
+        if "\x00" in value:
+            raise ToolInputError(field, "contains a NUL byte")
+        if len(value) > MAX_TEMPLATE_LEN:
+            raise ToolInputError(field, f"exceeds {MAX_TEMPLATE_LEN} chars")
+    elif kind == "payload":
+        _check_payload(value, field)
+
+
+# (field, kind, required) per tool. Only fields with an injection or abuse
+# surface are listed; every other tool/field passes through untouched. Keyed
+# per-tool because the same arg name can mean different things: automation_id is
+# an entity_id for toggle/trigger (goes into a service body) but a path-
+# interpolated config id for update/delete/trace. Payload fields are marked
+# not-required so a missing one still raises the handler's own error (behavior
+# unchanged); we only validate them when present.
+_TOOL_INPUT_SPECS: Dict[str, List[tuple]] = {
+    "get_entity_state":           [("entity_id", "entity_id", True)],
+    "call_service":               [("domain", "slug", True), ("service", "slug", True),
+                                   ("entity_id", "payload", False), ("service_data", "payload", False)],
+    "call_service_with_response": [("domain", "slug", True), ("service", "slug", True),
+                                   ("service_data", "payload", False)],
+    "fire_event":                 [("event_type", "slug", True), ("event_data", "payload", False)],
+    "set_state":                  [("entity_id", "entity_id", True), ("state", "string", True),
+                                   ("attributes", "payload", False)],
+    "delete_state":               [("entity_id", "entity_id", True)],
+    "render_template":            [("template", "template", True)],
+    "toggle_automation":          [("automation_id", "entity_id", True)],
+    "turn_on_automation":         [("automation_id", "entity_id", True)],
+    "turn_off_automation":        [("automation_id", "entity_id", True)],
+    "trigger_automation":         [("automation_id", "entity_id", True)],
+    "get_automation":             [("automation_id", "entity_id", True)],
+    "update_automation":          [("automation_id", "config_id", True), ("config", "payload", False)],
+    "delete_automation":          [("automation_id", "config_id", True)],
+    "get_automation_trace":       [("automation_id", "config_id", True)],
+    "create_automation":          [("config", "payload", False)],
+    "create_script":              [("script_id", "config_id", True), ("config", "payload", False)],
+    "update_script":              [("script_id", "config_id", True), ("config", "payload", False)],
+    "delete_script":              [("script_id", "config_id", True)],
+}
+
+
+def validate_tool_input(name: str, arguments: Dict[str, Any]) -> None:
+    """Validate a tool's arguments before any Home Assistant call.
+
+    Raises ToolInputError on the first failure. Tools absent from the spec table
+    — the read-only / no-identifier majority — are not constrained. This is a
+    middleware-layer guard: it never changes what a valid call does; it only
+    rejects inputs HA itself could not accept (or that could escape a REST path).
+    """
+    spec = _TOOL_INPUT_SPECS.get(name)
+    if not spec:
+        return
+    if not isinstance(arguments, dict):
+        raise ToolInputError("arguments", "must be an object")
+    for field, kind, required in spec:
+        if field not in arguments or arguments[field] is None:
+            if required:
+                raise ToolInputError(field, "is required")
+            continue
+        _check_field(kind, arguments[field], field)
+
 
 @server.list_resources()
 async def handle_list_resources() -> List[Resource]:
@@ -2731,7 +2958,25 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
             type="text",
             text=json.dumps({"error": "HA_TOKEN not configured"})
         )]
-    
+
+    # Security middleware layer (CLAUDE.md): rate-limit the client, then validate
+    # service-call inputs — both before any Home Assistant request is made.
+    try:
+        rate_limiter.check(_client_id())
+    except RateLimitExceeded as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "rate_limited",
+            "retry_after_seconds": round(e.retry_after, 2),
+        }))]
+    try:
+        validate_tool_input(name, arguments)
+    except ToolInputError as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "validation_failed",
+            "field": e.field,
+            "reason": e.reason,
+        }))]
+
     try:
         async with HomeAssistantClient(HA_URL, HA_TOKEN) as client:
             if name == "get_entity_state":
@@ -3347,7 +3592,8 @@ class _BearerAuthMiddleware:
         self._expected = f"Bearer {token}".encode("latin-1")
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        stype = scope.get("type")
+        if stype == "http":
             headers = dict(scope.get("headers") or [])
             provided = headers.get(b"authorization", b"")
             if not hmac.compare_digest(provided, self._expected):
@@ -3358,6 +3604,17 @@ class _BearerAuthMiddleware:
                 })
                 await send({"type": "http.response.body", "body": b"Unauthorized"})
                 return
+        elif stype == "websocket":
+            # No bearer-check path exists for websockets here, so refuse the
+            # handshake rather than let it bypass auth. No WS routes are mounted
+            # today; this is fail-closed for when SSE/WS transports are added.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        elif stype != "lifespan":
+            # lifespan is the server lifecycle, not a client request — pass it
+            # through. Any other (unknown) client scope is denied by not
+            # forwarding it to the app.
+            return
         await self.app(scope, receive, send)
 
 
@@ -3421,8 +3678,11 @@ def _enforce_exposure_gate(host: str) -> None:
     """
     if _is_loopback(host):
         return
+    # .strip() so a whitespace-only value (e.g. MCP_AUTH_TOKEN="   ") counts as
+    # missing rather than satisfying the gate while being effectively empty.
     missing = [
-        var for var in ("MCP_AUTH_TOKEN", "MCP_ALLOWED_HOSTS") if not os.getenv(var)
+        var for var in ("MCP_AUTH_TOKEN", "MCP_ALLOWED_HOSTS")
+        if not os.getenv(var, "").strip()
     ]
     if missing:
         raise SystemExit(
