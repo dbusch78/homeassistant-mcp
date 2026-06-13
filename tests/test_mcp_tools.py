@@ -141,8 +141,20 @@ async def test_tool_schemas():
                     schema_issues.append(f"Tool {tool.name} schema missing 'type'")
                 if 'properties' not in tool.inputSchema:
                     schema_issues.append(f"Tool {tool.name} schema missing 'properties'")
-                if 'required' not in tool.inputSchema:
-                    schema_issues.append(f"Tool {tool.name} schema missing 'required'")
+                # 'required' is OPTIONAL in JSON Schema: a tool with no mandatory
+                # params correctly omits it, so its absence is not an error. Only
+                # validate it when present — it must be a list of declared properties.
+                required = tool.inputSchema.get('required')
+                if required is not None:
+                    if not isinstance(required, list):
+                        schema_issues.append(f"Tool {tool.name} schema 'required' must be a list")
+                    else:
+                        props = tool.inputSchema.get('properties', {}) or {}
+                        for field in required:
+                            if field not in props:
+                                schema_issues.append(
+                                    f"Tool {tool.name} 'required' names undeclared property '{field}'"
+                                )
         
         if schema_issues:
             print(f"❌ Found {len(schema_issues)} schema issues:")

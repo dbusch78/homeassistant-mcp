@@ -11,9 +11,11 @@ Provides tools to interact with Home Assistant API including:
 """
 
 import asyncio
+import hmac
 import json
 import logging
 import os
+import re
 import uuid
 import time
 from typing import Any, Dict, List, Optional, Union, Set
@@ -35,6 +37,13 @@ from mcp.types import (
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("homeassistant-mcp")
+
+# aiohttp's default WebSocket max message size is 4 MiB, but Home Assistant
+# registry/state dumps (e.g. config/entity_registry/list) routinely exceed that on
+# larger installs and trip WSCloseCode.MESSAGE_TOO_BIG, breaking any tool that uses
+# the WS API (entity registry, areas-by-area, automations, etc.). Raise the cap.
+# Override via HA_WS_MAX_MSG_SIZE (bytes); 0 disables the limit entirely.
+WS_MAX_MSG_SIZE = int(os.getenv("HA_WS_MAX_MSG_SIZE", str(64 * 1024 * 1024)))
 
 def _paginate(
     items: list,
@@ -119,7 +128,7 @@ class HomeAssistantClient:
             raise RuntimeError("Client not initialized. Use async context manager.")
 
         logger.info(f"Connecting WebSocket to {self._ws_url}")
-        self._ws = await self.session.ws_connect(self._ws_url)
+        self._ws = await self.session.ws_connect(self._ws_url, max_msg_size=WS_MAX_MSG_SIZE)
         self._ws_authenticated = False
         self._ws_id = 0
 
@@ -775,27 +784,32 @@ class HomeAssistantClient:
         return await self.call_service("script", "reload")
 
     # Area Management
+    #
+    # The area registry has no REST endpoint — /api/config/area_registry returns 404
+    # on modern HA (verified against 2026.6). It is WebSocket-only, like the device
+    # and entity registries, so all four operations go through config/area_registry/*
+    # WS commands (mirroring get_devices / get_entity_registry).
     async def get_areas(self) -> List[Dict[str, Any]]:
-        """Get all areas/zones"""
-        return await self._request("GET", "/api/config/area_registry")
-    
+        """Get all areas via the WebSocket area registry."""
+        return await self._ws_send_command({"type": "config/area_registry/list"})
+
     async def create_area(self, name: str, aliases: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Create a new area"""
-        data = {"name": name}
+        """Create a new area via the WebSocket area registry."""
+        cmd: Dict[str, Any] = {"type": "config/area_registry/create", "name": name}
         if aliases:
-            data["aliases"] = aliases
-        return await self._request("POST", "/api/config/area_registry", json=data)
-    
+            cmd["aliases"] = aliases
+        return await self._ws_send_command(cmd)
+
     async def update_area(self, area_id: str, name: str, aliases: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Update an existing area"""
-        data = {"name": name}
+        """Update an existing area via the WebSocket area registry."""
+        cmd: Dict[str, Any] = {"type": "config/area_registry/update", "area_id": area_id, "name": name}
         if aliases:
-            data["aliases"] = aliases
-        return await self._request("POST", f"/api/config/area_registry/{area_id}", json=data)
-    
+            cmd["aliases"] = aliases
+        return await self._ws_send_command(cmd)
+
     async def delete_area(self, area_id: str) -> Dict[str, Any]:
-        """Delete an area"""
-        return await self._request("DELETE", f"/api/config/area_registry/{area_id}")
+        """Delete an area via the WebSocket area registry."""
+        return await self._ws_send_command({"type": "config/area_registry/delete", "area_id": area_id})
     
     # Device Management
     async def get_devices(self, search: Optional[str] = None, offset: int = 0, limit: int = 0) -> Dict[str, Any]:
@@ -1020,7 +1034,14 @@ class SSESubscription:
         return True
 
 class SSEManager:
-    """Manages SSE connections and subscriptions"""
+    """Manages SSE connections and subscriptions.
+
+    TODO: implement in feature/sse-streaming on HTTP transport. This machinery is
+    retained but not wired to the tool layer — under stdio there is no channel to
+    push events to the client, so subscribe_events/get_sse_stats currently return
+    a not_implemented response (see handle_call_tool). _handle_ha_event only logs
+    events; real delivery lands with the streamable-HTTP transport.
+    """
     
     def __init__(self):
         self.subscriptions: Dict[str, SSESubscription] = {}
@@ -1207,6 +1228,247 @@ HA_TOKEN = os.getenv("HA_TOKEN", "")
 
 if not HA_TOKEN:
     logger.warning("HA_TOKEN not set. You'll need to provide it via environment variable.")
+
+
+# ---------------------------------------------------------------------------
+# Security middleware layer
+#
+# CLAUDE.md requires per-call rate limiting and input sanitization on service
+# calls. Both were declared requirements but never wired to the tool path; this
+# adds them. Everything here runs at the single tool-call chokepoint
+# (handle_call_tool), so it covers all tools over both transports (stdio + HTTP)
+# without changing any individual tool's logic.
+# ---------------------------------------------------------------------------
+
+# Token-bucket limits, env-configurable. Defaults are generous enough not to
+# impede interactive Claude Code bursts, but cap a runaway agent loop hammering
+# the (resource-constrained) Home Assistant box.
+RATE_LIMIT_RPM = int(os.getenv("MCP_RATE_LIMIT_RPM", "120"))
+RATE_LIMIT_BURST = int(os.getenv("MCP_RATE_LIMIT_BURST", "20"))
+
+
+class RateLimitExceeded(Exception):
+    """Raised when a client exceeds its tool-call token bucket."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"rate limit exceeded; retry after {retry_after:.1f}s")
+
+
+class RateLimiter:
+    """Per-client token-bucket rate limiter for tool calls.
+
+    capacity = burst (calls available instantly); the bucket refills at rpm/60
+    tokens per second up to capacity. A call consumes one token; an empty bucket
+    raises RateLimitExceeded with the seconds until the next token is available.
+
+    Buckets are keyed by client id (see _client_id): one per stdio process, one
+    per HTTP session. State is in-process only — correct for this single-process
+    server; a multi-process deployment would need shared state. A monotonic clock
+    is injected so tests can advance time deterministically.
+    """
+
+    def __init__(self, rpm: int = RATE_LIMIT_RPM, burst: int = RATE_LIMIT_BURST,
+                 time_fn=time.monotonic):
+        if rpm <= 0 or burst <= 0:
+            raise ValueError("rpm and burst must both be positive")
+        self._rate = rpm / 60.0            # tokens per second
+        self._capacity = float(burst)
+        self._time = time_fn
+        self._buckets: Dict[str, tuple] = {}   # client_id -> (tokens, last_ts)
+
+    def check(self, client_id: str) -> None:
+        """Consume one token for client_id, or raise RateLimitExceeded."""
+        now = self._time()
+        tokens, last = self._buckets.get(client_id, (self._capacity, now))
+        # Refill for elapsed time, capped at capacity.
+        tokens = min(self._capacity, tokens + (now - last) * self._rate)
+        if tokens < 1.0:
+            # Persist the refill so elapsed time still counts toward the next token.
+            self._buckets[client_id] = (tokens, now)
+            raise RateLimitExceeded((1.0 - tokens) / self._rate)
+        self._buckets[client_id] = (tokens - 1.0, now)
+
+
+rate_limiter = RateLimiter()
+
+
+def _client_id() -> str:
+    """Identify the calling client for rate limiting.
+
+    - stdio: a single connected process -> constant "stdio".
+    - HTTP: the per-connection MCP session id when present (the client echoes
+      Mcp-Session-Id on every call), else the remote address.
+
+    Falls back to a per-transport constant if no finer id is reachable, so a
+    missing id can never disable rate limiting (fail onto a shared bucket, never
+    fail open).
+    """
+    try:
+        ctx = server.request_context
+    except (LookupError, AttributeError):
+        return "stdio"          # no active request context (e.g. direct call)
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return "stdio"          # stdio transport carries no HTTP request
+    try:
+        sid = request.headers.get("mcp-session-id")
+        if sid:
+            return f"http:{sid}"
+        client = getattr(request, "client", None)
+        if client and getattr(client, "host", None):
+            return f"http:{client.host}"
+    except AttributeError:
+        pass
+    return "http"               # fail-closed onto a shared HTTP bucket
+
+
+# --- service-call input validation -------------------------------------------
+#
+# These identifiers are interpolated directly into Home Assistant REST paths
+# (e.g. /api/services/{domain}/{service}, /api/states/{entity_id},
+# /api/config/automation/config/{id}), so a value containing "/", ".." or a
+# control char could escape the intended endpoint. Validate before any HA call.
+# The grammars below are exactly what HA itself accepts, so validation can never
+# reject a call HA would have honored — it only blocks malformed/injecting input.
+_SLUG_RE = re.compile(r"^[a-z0-9_]+$")              # domain / service (true slugs)
+_ENTITY_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")   # <domain>.<object_id>
+_CONFIG_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")     # automation/script config id (path-safe)
+# event_type is NOT a slug: HA enforces no real grammar on it (it's an arbitrary
+# string), and standard events carry dots (timer.finished) while custom ones may
+# use hyphens. A live audit of this instance found 0 hyphens but `timer.finished`
+# — which the old slug pattern wrongly rejected. So allow dots/hyphens/upper, and
+# enforce path-safety separately (no "/", no "..", no leading/trailing dot) since
+# event_type is interpolated into /api/events/{event_type}.
+_EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+# Generous structural caps on free-form payloads — meant to stop pathological
+# nesting and NUL/control injection, not to second-guess large but legitimate
+# automation or dashboard configs.
+MAX_STRING_LEN = 64 * 1024
+MAX_TEMPLATE_LEN = 64 * 1024
+MAX_PAYLOAD_DEPTH = 32
+
+
+class ToolInputError(Exception):
+    """Raised when a tool's arguments fail validation before reaching HA."""
+
+    def __init__(self, field: str, reason: str):
+        self.field = field
+        self.reason = reason
+        super().__init__(f"{field}: {reason}")
+
+
+def _check_payload(value: Any, field: str, depth: int = 0) -> None:
+    """Bound a free-form JSON payload: nesting depth, string length, no NUL."""
+    if depth > MAX_PAYLOAD_DEPTH:
+        raise ToolInputError(field, f"nested deeper than {MAX_PAYLOAD_DEPTH} levels")
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise ToolInputError(field, "contains a NUL byte")
+        if len(value) > MAX_STRING_LEN:
+            raise ToolInputError(field, f"string exceeds {MAX_STRING_LEN} chars")
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ToolInputError(field, "object keys must be strings")
+            _check_payload(k, field, depth + 1)
+            _check_payload(v, field, depth + 1)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_payload(item, field, depth + 1)
+    # numbers / bool / None: nothing to bound.
+
+
+def _check_field(kind: str, value: Any, field: str) -> None:
+    if kind == "slug":
+        if not isinstance(value, str) or not _SLUG_RE.match(value):
+            raise ToolInputError(field, "must be a lowercase identifier [a-z0-9_]")
+    elif kind == "event_type":
+        if not isinstance(value, str) or not _EVENT_TYPE_RE.match(value):
+            raise ToolInputError(field, "must match [A-Za-z0-9_.-]")
+        # Path-safety: "." is allowed (timer.finished), but a "/" never reaches
+        # here (not in the class), and "..", leading/trailing "." could escape
+        # /api/events/{event_type} — reject those explicitly.
+        if "/" in value or ".." in value or value.startswith(".") or value.endswith("."):
+            raise ToolInputError(field, "is not a path-safe event type")
+    elif kind == "entity_id":
+        if not isinstance(value, str) or not _ENTITY_ID_RE.match(value):
+            raise ToolInputError(field, "must be a valid entity_id '<domain>.<object_id>'")
+    elif kind == "config_id":
+        if not isinstance(value, str) or not _CONFIG_ID_RE.match(value):
+            raise ToolInputError(field, "must match [A-Za-z0-9_-] (no path separators)")
+    elif kind == "string":
+        if not isinstance(value, str):
+            raise ToolInputError(field, "must be a string")
+        if "\x00" in value:
+            raise ToolInputError(field, "contains a NUL byte")
+        if len(value) > MAX_STRING_LEN:
+            raise ToolInputError(field, f"exceeds {MAX_STRING_LEN} chars")
+    elif kind == "template":
+        if not isinstance(value, str):
+            raise ToolInputError(field, "must be a string")
+        if "\x00" in value:
+            raise ToolInputError(field, "contains a NUL byte")
+        if len(value) > MAX_TEMPLATE_LEN:
+            raise ToolInputError(field, f"exceeds {MAX_TEMPLATE_LEN} chars")
+    elif kind == "payload":
+        _check_payload(value, field)
+
+
+# (field, kind, required) per tool. Only fields with an injection or abuse
+# surface are listed; every other tool/field passes through untouched. Keyed
+# per-tool because the same arg name can mean different things: automation_id is
+# an entity_id for toggle/trigger (goes into a service body) but a path-
+# interpolated config id for update/delete/trace. Payload fields are marked
+# not-required so a missing one still raises the handler's own error (behavior
+# unchanged); we only validate them when present.
+_TOOL_INPUT_SPECS: Dict[str, List[tuple]] = {
+    "get_entity_state":           [("entity_id", "entity_id", True)],
+    "call_service":               [("domain", "slug", True), ("service", "slug", True),
+                                   ("entity_id", "payload", False), ("service_data", "payload", False)],
+    "call_service_with_response": [("domain", "slug", True), ("service", "slug", True),
+                                   ("service_data", "payload", False)],
+    "fire_event":                 [("event_type", "event_type", True), ("event_data", "payload", False)],
+    "set_state":                  [("entity_id", "entity_id", True), ("state", "string", True),
+                                   ("attributes", "payload", False)],
+    "delete_state":               [("entity_id", "entity_id", True)],
+    "render_template":            [("template", "template", True)],
+    "toggle_automation":          [("automation_id", "entity_id", True)],
+    "turn_on_automation":         [("automation_id", "entity_id", True)],
+    "turn_off_automation":        [("automation_id", "entity_id", True)],
+    "trigger_automation":         [("automation_id", "entity_id", True)],
+    "get_automation":             [("automation_id", "entity_id", True)],
+    "update_automation":          [("automation_id", "config_id", True), ("config", "payload", False)],
+    "delete_automation":          [("automation_id", "config_id", True)],
+    "get_automation_trace":       [("automation_id", "config_id", True)],
+    "create_automation":          [("config", "payload", False)],
+    "create_script":              [("script_id", "config_id", True), ("config", "payload", False)],
+    "update_script":              [("script_id", "config_id", True), ("config", "payload", False)],
+    "delete_script":              [("script_id", "config_id", True)],
+}
+
+
+def validate_tool_input(name: str, arguments: Dict[str, Any]) -> None:
+    """Validate a tool's arguments before any Home Assistant call.
+
+    Raises ToolInputError on the first failure. Tools absent from the spec table
+    — the read-only / no-identifier majority — are not constrained. This is a
+    middleware-layer guard: it never changes what a valid call does; it only
+    rejects inputs HA itself could not accept (or that could escape a REST path).
+    """
+    spec = _TOOL_INPUT_SPECS.get(name)
+    if not spec:
+        return
+    if not isinstance(arguments, dict):
+        raise ToolInputError("arguments", "must be an object")
+    for field, kind, required in spec:
+        if field not in arguments or arguments[field] is None:
+            if required:
+                raise ToolInputError(field, "is required")
+            continue
+        _check_field(kind, arguments[field], field)
+
 
 @server.list_resources()
 async def handle_list_resources() -> List[Resource]:
@@ -2711,7 +2973,25 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
             type="text",
             text=json.dumps({"error": "HA_TOKEN not configured"})
         )]
-    
+
+    # Security middleware layer (CLAUDE.md): rate-limit the client, then validate
+    # service-call inputs — both before any Home Assistant request is made.
+    try:
+        rate_limiter.check(_client_id())
+    except RateLimitExceeded as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "rate_limited",
+            "retry_after_seconds": round(e.retry_after, 2),
+        }))]
+    try:
+        validate_tool_input(name, arguments)
+    except ToolInputError as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "validation_failed",
+            "field": e.field,
+            "reason": e.reason,
+        }))]
+
     try:
         async with HomeAssistantClient(HA_URL, HA_TOKEN) as client:
             if name == "get_entity_state":
@@ -2757,9 +3037,26 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 result = filtered_entities
                 
             elif name == "get_area_entities":
-                # This would require additional API calls to get area information
-                # For now, return a placeholder
-                result = {"message": "Area entity lookup requires additional implementation"}
+                # Resolve the human-friendly area name to an area_id, then reuse the
+                # working get_entities_by_area lookup. Match the name case-insensitively
+                # against each area's name and its aliases.
+                area_name = arguments["area_name"]
+                target = area_name.strip().lower()
+                areas = await client.get_areas()
+                area_id = None
+                for area in areas:
+                    names = [area.get("name", "")] + list(area.get("aliases") or [])
+                    if any((n or "").strip().lower() == target for n in names):
+                        area_id = area.get("area_id")
+                        break
+                if area_id is None:
+                    result = {
+                        "error": "area_not_found",
+                        "message": f"No area matched name '{area_name}'.",
+                        "available_areas": [a.get("name") for a in areas],
+                    }
+                else:
+                    result = await client.get_entities_by_area(area_id=area_id)
                 
             elif name == "fire_event":
                 event_type = arguments["event_type"]
@@ -2852,29 +3149,30 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 result = await client.handle_intent(intent_name, intent_data)
                 
             elif name == "subscribe_events":
-                # Handle SSE subscription
-                events = set(arguments.get("events", []))
-                entity_id = arguments.get("entity_id")
-                domain = arguments.get("domain")
-                
-                try:
-                    client_id = sse_manager.add_subscription(events, entity_id, domain)
-                    # Start the event stream
-                    await sse_manager.start_event_stream(client_id, HA_URL, HA_TOKEN)
-                    
-                    result = {
-                        "status": "subscribed",
-                        "client_id": client_id,
-                        "events": list(events),
-                        "entity_id": entity_id,
-                        "domain": domain,
-                        "message": "Successfully subscribed to Home Assistant events"
-                    }
-                except ValueError as e:
-                    result = {"error": str(e)}
-                
+                # Real-time streaming is not wired up: the stdio transport has no
+                # channel to push events to the client, and SSEManager only logged
+                # events without delivering them. Report that honestly instead of
+                # claiming a successful subscription that never emits anything.
+                # See feature/sse-streaming (planned, on the HTTP transport).
+                result = {
+                    "error": "not_implemented",
+                    "message": (
+                        "Real-time event streaming is not yet supported in stdio "
+                        "transport. Use get_history or poll get_entity_state for state "
+                        "changes. Event streaming will be implemented as a feature on "
+                        "the HTTP transport."
+                    ),
+                    "alternatives": ["get_history", "get_entity_state", "get_logbook"],
+                }
+
             elif name == "get_sse_stats":
-                result = sse_manager.get_stats()
+                result = {
+                    "error": "not_implemented",
+                    "message": (
+                        "SSE statistics are not available. Event streaming is pending "
+                        "implementation on HTTP transport."
+                    ),
+                }
                 
             elif name == "get_automations":
                 result = await client.get_automations(
@@ -3224,18 +3522,18 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
             text=json.dumps({"error": str(e)})
         )]
 
-async def main():
-    """Run the MCP server"""
+async def run_stdio():
+    """Run the MCP server over stdio (default; Claude Desktop, start_mcp.sh)."""
     # Import here to avoid issues if mcp package isn't available
     from mcp.server.stdio import stdio_server
-    
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,
             write_stream,
             InitializationOptions(
                 server_name="homeassistant-mcp",
-                server_version="1.0.0",
+                server_version="1.1.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
@@ -3243,9 +3541,211 @@ async def main():
             ),
         )
 
+
+# Backwards-compatible alias: the original entry point was main() (stdio).
+main = run_stdio
+
+
+def _is_loopback(host: str) -> bool:
+    """True only for loopback hosts. 0.0.0.0 binds all interfaces and is NOT loopback."""
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _build_security_settings(host: str, port: int):
+    """Build DNS-rebinding protection settings for the HTTP transport.
+
+    We ALWAYS construct explicit settings with protection enabled. This is
+    deliberate and load-bearing: the SDK's TransportSecurityMiddleware, when given
+    no settings, defaults to enable_dns_rebinding_protection=False ("backwards
+    compatibility"). Passing security_settings=None to the session manager would
+    therefore silently disable ALL Host/Origin validation. Never rely on that
+    default — build settings here every time.
+
+    Defaults are exact, single-entry lists derived from the bind host:port:
+        allowed_hosts   = ["127.0.0.1:8787"]          (Host header must match exactly)
+        allowed_origins = ["http://127.0.0.1:8787"]   (Origin, if present, must match)
+    Note this means connecting via http://localhost:8787 is REJECTED on a 127.0.0.1
+    bind (Host "localhost:8787" != "127.0.0.1:8787"). Override with MCP_ALLOWED_HOSTS
+    / MCP_ALLOWED_ORIGINS (comma-separated) if you need additional names.
+
+    NOTE: Origin header absent = allowed (non-browser clients). Claude Code and other
+    non-browser MCP clients send no Origin header, and the SDK's _validate_origin
+    returns True when Origin is missing — so there is NO Origin check for requests
+    that omit it. This is correct for our non-browser clients. Do NOT expose this
+    endpoint to a browser-accessible context without adding explicit Origin
+    enforcement, or DNS-rebinding protection via Origin is bypassable.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts_env = os.getenv("MCP_ALLOWED_HOSTS")
+    origins_env = os.getenv("MCP_ALLOWED_ORIGINS")
+    allowed_hosts = (
+        [h.strip() for h in hosts_env.split(",") if h.strip()]
+        if hosts_env else [f"{host}:{port}"]
+    )
+    allowed_origins = (
+        [o.strip() for o in origins_env.split(",") if o.strip()]
+        if origins_env else [f"http://{host}:{port}"]
+    )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=allowed_origins,
+    )
+
+
+class _BearerAuthMiddleware:
+    """Pure-ASGI middleware enforcing 'Authorization: Bearer <token>'.
+
+    Only installed when MCP_AUTH_TOKEN is set. This is the minimum access gate for
+    binding beyond loopback; fuller auth hardening is tracked on a separate
+    security/* branch. The token is read from the environment and never logged.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self._expected = f"Bearer {token}".encode("latin-1")
+
+    async def __call__(self, scope, receive, send):
+        stype = scope.get("type")
+        if stype == "http":
+            headers = dict(scope.get("headers") or [])
+            provided = headers.get(b"authorization", b"")
+            if not hmac.compare_digest(provided, self._expected):
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [(b"content-type", b"text/plain")],
+                })
+                await send({"type": "http.response.body", "body": b"Unauthorized"})
+                return
+        elif stype == "websocket":
+            # No bearer-check path exists for websockets here, so refuse the
+            # handshake rather than let it bypass auth. No WS routes are mounted
+            # today; this is fail-closed for when SSE/WS transports are added.
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        elif stype != "lifespan":
+            # lifespan is the server lifecycle, not a client request — pass it
+            # through. Any other (unknown) client scope is denied by not
+            # forwarding it to the app.
+            return
+        await self.app(scope, receive, send)
+
+
+def build_http_app(host: str, port: int, path: str):
+    """Build the Starlette ASGI app exposing the MCP endpoint over Streamable HTTP."""
+    import contextlib
+
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+    security = _build_security_settings(host, port)
+    session_manager = StreamableHTTPSessionManager(app=server, security_settings=security)
+
+    class _MCPEndpoint:
+        """Pure-ASGI endpoint delegating to the Streamable HTTP session manager.
+
+        A class instance (not a function/method) so Starlette's Route mounts it as
+        a raw ASGI app and passes every method (GET for the SSE stream, POST for
+        messages, DELETE for session teardown) straight through, instead of
+        wrapping it as a request/response handler limited to GET.
+        """
+
+        async def __call__(self, scope, receive, send):
+            await session_manager.handle_request(scope, receive, send)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        async with session_manager.run():
+            logger.info("HA-MCP HTTP transport ready at http://%s:%s%s", host, port, path)
+            yield
+
+    # Register the endpoint at BOTH the bare path and its trailing-slash form so
+    # each returns 200 directly. A single Starlette Mount("/mcp", ...) 307-redirects
+    # "/mcp" -> "/mcp/" at the routing layer, which is an extra POST round-trip and
+    # the source of Claude Code's "/doctor" setting warning. Two explicit Routes
+    # both match exactly, so neither path redirects.
+    endpoint = _MCPEndpoint()
+    bare = "/" + path.strip("/")
+    app = Starlette(
+        routes=[Route(bare, endpoint), Route(bare + "/", endpoint)],
+        lifespan=lifespan,
+    )
+
+    if os.getenv("MCP_AUTH_TOKEN"):
+        app.add_middleware(_BearerAuthMiddleware, token=os.environ["MCP_AUTH_TOKEN"])
+        logger.info("Bearer-token auth enabled for HTTP transport")
+
+    return app
+
+
+def _enforce_exposure_gate(host: str) -> None:
+    """Refuse to expose HA control tools beyond this machine without explicit safeguards.
+
+    A non-loopback bind has two distinct failure modes, so we require an explicit
+    answer to both:
+      - MCP_AUTH_TOKEN: otherwise the 87 HA-control tools are reachable unauthenticated.
+      - MCP_ALLOWED_HOSTS: the auto-derived "host:port" default does not work for a
+        0.0.0.0 / all-interfaces bind (the Host header is the client-facing address,
+        not 0.0.0.0), so without this the server would reject every request anyway.
+    """
+    if _is_loopback(host):
+        return
+    # .strip() so a whitespace-only value (e.g. MCP_AUTH_TOKEN="   ") counts as
+    # missing rather than satisfying the gate while being effectively empty.
+    missing = [
+        var for var in ("MCP_AUTH_TOKEN", "MCP_ALLOWED_HOSTS")
+        if not os.getenv(var, "").strip()
+    ]
+    if missing:
+        raise SystemExit(
+            f"Refusing to start: HTTP host '{host}' is not loopback, which exposes "
+            f"all Home Assistant control tools beyond this machine. Set "
+            f"{' and '.join(missing)} before binding to a non-loopback address."
+        )
+
+
+async def run_http(host: str, port: int, path: str) -> None:
+    """Run the MCP server over Streamable HTTP (multi-client; AI agents, Claude Code)."""
+    import uvicorn
+
+    config = uvicorn.Config(build_http_app(host, port, path), host=host, port=port, log_level="info")
+    await uvicorn.Server(config).serve()
+
+
 def cli() -> None:
     """Synchronous entry point for console_scripts / uvx."""
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="homeassistant-mcp",
+        description="Home Assistant MCP server (stdio or Streamable HTTP transport)",
+    )
+    parser.add_argument(
+        "--transport", choices=["stdio", "http"],
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="Transport to serve (default: stdio; env MCP_TRANSPORT)",
+    )
+    parser.add_argument("--host", default=None,
+                        help="HTTP bind host (env MCP_HTTP_HOST, default 127.0.0.1)")
+    parser.add_argument("--port", default=None,
+                        help="HTTP bind port (env MCP_HTTP_PORT, default 8787)")
+    parser.add_argument("--path", default=None,
+                        help="HTTP MCP endpoint path (env MCP_HTTP_PATH, default /mcp)")
+    args = parser.parse_args()
+
+    if args.transport == "http":
+        host = args.host or os.getenv("MCP_HTTP_HOST", "127.0.0.1")
+        port = int(args.port or os.getenv("MCP_HTTP_PORT", "8787"))
+        path = args.path or os.getenv("MCP_HTTP_PATH", "/mcp")
+        if not path.startswith("/"):
+            path = "/" + path
+        _enforce_exposure_gate(host)
+        asyncio.run(run_http(host, port, path))
+    else:
+        asyncio.run(run_stdio())
 
 
 if __name__ == "__main__":

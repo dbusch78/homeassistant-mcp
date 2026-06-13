@@ -1,6 +1,6 @@
 # Home Assistant MCP Server
 
-A comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for Home Assistant. Gives Claude agents (and any MCP-compatible AI client) full programmatic access to your Home Assistant instance via REST API and WebSocket — 70+ tools across entity management, automations, scripts, scenes, Lovelace dashboards, HACS, Fully Kiosk tablets, and more.
+A comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for Home Assistant. Gives Claude agents (and any MCP-compatible AI client) full programmatic access to your Home Assistant instance via REST API and WebSocket — 87 tools across entity management, automations, scripts, scenes, Lovelace dashboards, HACS, Fully Kiosk tablets, and more.
 
 ## Features
 
@@ -16,7 +16,7 @@ A comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io/)
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.10+
 - Home Assistant instance (local or remote, HTTP or HTTPS)
 - A Home Assistant [long-lived access token](https://developers.home-assistant.io/docs/auth_api/#long-lived-access-token)
 
@@ -47,10 +47,17 @@ HA_TOKEN=your_long_lived_access_token_here
 
 ## Usage
 
+### Transports
+
+The server speaks two MCP transports from the same 87 tools:
+
+- **stdio** (default) — `python server.py`. Used by Claude Desktop and `start_mcp.sh`; the client launches the server as a subprocess.
+- **Streamable HTTP** — `python server.py --transport http`. A long-running multi-client endpoint for Claude Code and networked AI agents.
+
 ### Start the server
 
 ```bash
-./start_server.sh
+./start_server.sh          # multi-client HTTP transport (default)
 ```
 
 Or directly:
@@ -58,7 +65,41 @@ Or directly:
 ```bash
 export HA_URL=http://homeassistant.local:8123
 export HA_TOKEN=your_token
-python server.py
+
+python server.py                       # stdio (default)
+python server.py --transport http      # Streamable HTTP on 127.0.0.1:8787/mcp
+```
+
+### HTTP transport (Claude Code & AI agents)
+
+Configurable via env (or `--host`/`--port`/`--path`):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `MCP_TRANSPORT` | `stdio` | `http` to serve over HTTP |
+| `MCP_HTTP_HOST` | `127.0.0.1` | Bind host |
+| `MCP_HTTP_PORT` | `8787` | Bind port |
+| `MCP_HTTP_PATH` | `/mcp` | Endpoint path |
+| `MCP_ALLOWED_HOSTS` | `<host>:<port>` | Allowed `Host` headers (DNS-rebinding protection) |
+| `MCP_ALLOWED_ORIGINS` | `http://<host>:<port>` | Allowed `Origin` headers |
+| `MCP_AUTH_TOKEN` | _unset_ | Require `Authorization: Bearer <token>` |
+| `MCP_RATE_LIMIT_RPM` | `120` | Per-client tool calls per minute (sustained) |
+| `MCP_RATE_LIMIT_BURST` | `20` | Per-client burst allowance (token-bucket capacity) |
+
+**Security model (read before exposing beyond localhost):**
+
+- **Rate limiting** is always on, on **every** tool call over both transports. Each client gets a token bucket — `MCP_RATE_LIMIT_BURST` calls instantly, refilling to `MCP_RATE_LIMIT_RPM`/min. Over-limit calls return `{"error": "rate_limited", "retry_after_seconds": N}` without touching Home Assistant. Clients are keyed per MCP session (HTTP) or per process (stdio).
+- **Input validation** runs on service-call tools before any HA request. Identifiers interpolated into HA REST paths (`domain`, `service`, `event_type`, `entity_id`, automation/script ids) are checked against HA's own grammar, and free-form payloads are bounded — so a value with `/`, `..`, a NUL byte, or pathological nesting is rejected with `{"error": "validation_failed", ...}` rather than reaching HA.
+- DNS-rebinding protection is always on. By default only the **exact** bind address is allowed — so `http://localhost:8787` is **rejected (HTTP 421)** on a `127.0.0.1` bind because `Host: localhost:8787 ≠ 127.0.0.1:8787`. Connect via the IP, or add `localhost:8787` to `MCP_ALLOWED_HOSTS`.
+- A **non-loopback bind refuses to start** unless both `MCP_AUTH_TOKEN` and `MCP_ALLOWED_HOSTS` are set (whitespace-only values don't count), so a stray `MCP_HTTP_HOST=0.0.0.0` can't silently expose Home Assistant control.
+
+Register the running server in **Claude Code**:
+
+```bash
+claude mcp add --transport http homeassistant http://127.0.0.1:8787/mcp
+# with a token:
+claude mcp add --transport http homeassistant http://127.0.0.1:8787/mcp \
+  --header "Authorization: Bearer $MCP_AUTH_TOKEN"
 ```
 
 ### Claude Desktop
