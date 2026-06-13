@@ -1228,6 +1228,100 @@ HA_TOKEN = os.getenv("HA_TOKEN", "")
 if not HA_TOKEN:
     logger.warning("HA_TOKEN not set. You'll need to provide it via environment variable.")
 
+
+# ---------------------------------------------------------------------------
+# Security middleware layer
+#
+# CLAUDE.md requires per-call rate limiting and input sanitization on service
+# calls. Both were declared requirements but never wired to the tool path; this
+# adds them. Everything here runs at the single tool-call chokepoint
+# (handle_call_tool), so it covers all tools over both transports (stdio + HTTP)
+# without changing any individual tool's logic.
+# ---------------------------------------------------------------------------
+
+# Token-bucket limits, env-configurable. Defaults are generous enough not to
+# impede interactive Claude Code bursts, but cap a runaway agent loop hammering
+# the (resource-constrained) Home Assistant box.
+RATE_LIMIT_RPM = int(os.getenv("MCP_RATE_LIMIT_RPM", "120"))
+RATE_LIMIT_BURST = int(os.getenv("MCP_RATE_LIMIT_BURST", "20"))
+
+
+class RateLimitExceeded(Exception):
+    """Raised when a client exceeds its tool-call token bucket."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"rate limit exceeded; retry after {retry_after:.1f}s")
+
+
+class RateLimiter:
+    """Per-client token-bucket rate limiter for tool calls.
+
+    capacity = burst (calls available instantly); the bucket refills at rpm/60
+    tokens per second up to capacity. A call consumes one token; an empty bucket
+    raises RateLimitExceeded with the seconds until the next token is available.
+
+    Buckets are keyed by client id (see _client_id): one per stdio process, one
+    per HTTP session. State is in-process only — correct for this single-process
+    server; a multi-process deployment would need shared state. A monotonic clock
+    is injected so tests can advance time deterministically.
+    """
+
+    def __init__(self, rpm: int = RATE_LIMIT_RPM, burst: int = RATE_LIMIT_BURST,
+                 time_fn=time.monotonic):
+        if rpm <= 0 or burst <= 0:
+            raise ValueError("rpm and burst must both be positive")
+        self._rate = rpm / 60.0            # tokens per second
+        self._capacity = float(burst)
+        self._time = time_fn
+        self._buckets: Dict[str, tuple] = {}   # client_id -> (tokens, last_ts)
+
+    def check(self, client_id: str) -> None:
+        """Consume one token for client_id, or raise RateLimitExceeded."""
+        now = self._time()
+        tokens, last = self._buckets.get(client_id, (self._capacity, now))
+        # Refill for elapsed time, capped at capacity.
+        tokens = min(self._capacity, tokens + (now - last) * self._rate)
+        if tokens < 1.0:
+            # Persist the refill so elapsed time still counts toward the next token.
+            self._buckets[client_id] = (tokens, now)
+            raise RateLimitExceeded((1.0 - tokens) / self._rate)
+        self._buckets[client_id] = (tokens - 1.0, now)
+
+
+rate_limiter = RateLimiter()
+
+
+def _client_id() -> str:
+    """Identify the calling client for rate limiting.
+
+    - stdio: a single connected process -> constant "stdio".
+    - HTTP: the per-connection MCP session id when present (the client echoes
+      Mcp-Session-Id on every call), else the remote address.
+
+    Falls back to a per-transport constant if no finer id is reachable, so a
+    missing id can never disable rate limiting (fail onto a shared bucket, never
+    fail open).
+    """
+    try:
+        ctx = server.request_context
+    except (LookupError, AttributeError):
+        return "stdio"          # no active request context (e.g. direct call)
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return "stdio"          # stdio transport carries no HTTP request
+    try:
+        sid = request.headers.get("mcp-session-id")
+        if sid:
+            return f"http:{sid}"
+        client = getattr(request, "client", None)
+        if client and getattr(client, "host", None):
+            return f"http:{client.host}"
+    except AttributeError:
+        pass
+    return "http"               # fail-closed onto a shared HTTP bucket
+
+
 @server.list_resources()
 async def handle_list_resources() -> List[Resource]:
     """List available Home Assistant resources"""
@@ -2731,7 +2825,17 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
             type="text",
             text=json.dumps({"error": "HA_TOKEN not configured"})
         )]
-    
+
+    # Security middleware layer (CLAUDE.md): rate-limit the client before any
+    # Home Assistant request is made.
+    try:
+        rate_limiter.check(_client_id())
+    except RateLimitExceeded as e:
+        return [TextContent(type="text", text=json.dumps({
+            "error": "rate_limited",
+            "retry_after_seconds": round(e.retry_after, 2),
+        }))]
+
     try:
         async with HomeAssistantClient(HA_URL, HA_TOKEN) as client:
             if name == "get_entity_state":

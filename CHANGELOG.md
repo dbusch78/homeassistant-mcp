@@ -24,6 +24,14 @@ patch release. Changes relative to the upstream baseline are recorded under the
   a non-loopback bind refuses to start without `MCP_AUTH_TOKEN` and
   `MCP_ALLOWED_HOSTS`; optional bearer-token auth via `MCP_AUTH_TOKEN`. Adds
   `starlette`/`uvicorn` deps and raises the `mcp` floor to `>=1.27.0`.
+- Per-client rate limiting on every tool call, across both transports. CLAUDE.md
+  listed rate limiting as a standing requirement ("must remain enabled"), but it
+  was never actually wired to the tool path — the only limiter lived on the
+  unused SSE manager. This is net-new: a token-bucket limiter at the single
+  tool-call chokepoint, keyed per MCP session (HTTP) or per process (stdio).
+  Configurable via `MCP_RATE_LIMIT_RPM` (default 120) and `MCP_RATE_LIMIT_BURST`
+  (default 20); over-limit calls return `{"error": "rate_limited",
+  "retry_after_seconds": N}` without contacting Home Assistant.
 
 ### Changed
 - `.gitignore` now excludes `CLAUDE.md` so machine/network-specific deployment
