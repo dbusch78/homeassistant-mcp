@@ -13,6 +13,8 @@ patch release. Changes relative to the upstream baseline are recorded under the
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-06-13
+
 ### Added
 - `CHANGELOG.md` following Keep a Changelog, tracking this fork's divergence from
   upstream.

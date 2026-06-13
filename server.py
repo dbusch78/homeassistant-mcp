@@ -3533,7 +3533,7 @@ async def run_stdio():
             write_stream,
             InitializationOptions(
                 server_name="homeassistant-mcp",
-                server_version="1.0.0",
+                server_version="1.1.0",
                 capabilities=server.get_capabilities(
                     notification_options=NotificationOptions(),
                     experimental_capabilities={},
