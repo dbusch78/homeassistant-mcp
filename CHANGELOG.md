@@ -41,6 +41,11 @@ patch release. Changes relative to the upstream baseline are recorded under the
   (nesting depth, string length, NUL bytes). Invalid input returns
   `{"error": "validation_failed", ...}` instead of reaching HA. Read-only tools
   are unconstrained; validation never rejects a call HA would have accepted.
+  `event_type` uses a looser path-safe grammar (`[A-Za-z0-9_.-]` plus a
+  traversal guard) than `domain`/`service`, because HA's own events carry dots
+  (e.g. `timer.finished`) and customs may use hyphens — a live audit of the
+  instance confirmed dotted event types are in use, which a strict slug pattern
+  would have wrongly rejected.
 
 ### Changed
 - `.gitignore` now excludes `CLAUDE.md` so machine/network-specific deployment

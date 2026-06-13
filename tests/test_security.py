@@ -118,6 +118,22 @@ def test_validation_rejects_path_injection():
     _expect_reject("delete_script", {"script_id": "a/b"}, "script_id")
 
 
+def test_validation_event_type_grammar():
+    # event_type is NOT a strict slug: HA's own events carry dots
+    # (timer.finished, found live on this instance) and customs may use hyphens.
+    _expect_ok("fire_event", {"event_type": "timer.finished"})
+    _expect_ok("fire_event", {"event_type": "my-custom-event", "event_data": {"a": 1}})
+    _expect_ok("fire_event", {"event_type": "state_changed"})
+    # ...but it is interpolated into /api/events/{event_type}, so path-traversal
+    # shapes must still be rejected.
+    _expect_reject("fire_event", {"event_type": "a/b"}, "event_type")              # slash
+    _expect_reject("fire_event", {"event_type": "../secrets"}, "event_type")       # dot-dot
+    _expect_reject("fire_event", {"event_type": "a..b"}, "event_type")             # embedded ..
+    _expect_reject("fire_event", {"event_type": ".hidden"}, "event_type")          # leading dot
+    _expect_reject("fire_event", {"event_type": "trailing."}, "event_type")        # trailing dot
+    _expect_reject("fire_event", {"event_type": "has space"}, "event_type")        # not in class
+
+
 def test_validation_rejects_bad_entity_id():
     _expect_reject("get_entity_state", {"entity_id": "no_dot_here"}, "entity_id")
     _expect_reject("get_entity_state", {"entity_id": "light./etc/passwd"}, "entity_id")
@@ -250,6 +266,7 @@ if __name__ == "__main__":
     test_rate_limiter_isolates_clients()
     test_rate_limiter_rejects_bad_config()
     test_validation_rejects_path_injection()
+    test_validation_event_type_grammar()
     test_validation_rejects_bad_entity_id()
     test_validation_rejects_missing_required()
     test_validation_rejects_payload_abuse()
