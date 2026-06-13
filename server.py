@@ -1331,9 +1331,16 @@ def _client_id() -> str:
 # control char could escape the intended endpoint. Validate before any HA call.
 # The grammars below are exactly what HA itself accepts, so validation can never
 # reject a call HA would have honored — it only blocks malformed/injecting input.
-_SLUG_RE = re.compile(r"^[a-z0-9_]+$")              # domain / service / event_type
+_SLUG_RE = re.compile(r"^[a-z0-9_]+$")              # domain / service (true slugs)
 _ENTITY_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")   # <domain>.<object_id>
 _CONFIG_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")     # automation/script config id (path-safe)
+# event_type is NOT a slug: HA enforces no real grammar on it (it's an arbitrary
+# string), and standard events carry dots (timer.finished) while custom ones may
+# use hyphens. A live audit of this instance found 0 hyphens but `timer.finished`
+# — which the old slug pattern wrongly rejected. So allow dots/hyphens/upper, and
+# enforce path-safety separately (no "/", no "..", no leading/trailing dot) since
+# event_type is interpolated into /api/events/{event_type}.
+_EVENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 # Generous structural caps on free-form payloads — meant to stop pathological
 # nesting and NUL/control injection, not to second-guess large but legitimate
@@ -1377,6 +1384,14 @@ def _check_field(kind: str, value: Any, field: str) -> None:
     if kind == "slug":
         if not isinstance(value, str) or not _SLUG_RE.match(value):
             raise ToolInputError(field, "must be a lowercase identifier [a-z0-9_]")
+    elif kind == "event_type":
+        if not isinstance(value, str) or not _EVENT_TYPE_RE.match(value):
+            raise ToolInputError(field, "must match [A-Za-z0-9_.-]")
+        # Path-safety: "." is allowed (timer.finished), but a "/" never reaches
+        # here (not in the class), and "..", leading/trailing "." could escape
+        # /api/events/{event_type} — reject those explicitly.
+        if "/" in value or ".." in value or value.startswith(".") or value.endswith("."):
+            raise ToolInputError(field, "is not a path-safe event type")
     elif kind == "entity_id":
         if not isinstance(value, str) or not _ENTITY_ID_RE.match(value):
             raise ToolInputError(field, "must be a valid entity_id '<domain>.<object_id>'")
@@ -1414,7 +1429,7 @@ _TOOL_INPUT_SPECS: Dict[str, List[tuple]] = {
                                    ("entity_id", "payload", False), ("service_data", "payload", False)],
     "call_service_with_response": [("domain", "slug", True), ("service", "slug", True),
                                    ("service_data", "payload", False)],
-    "fire_event":                 [("event_type", "slug", True), ("event_data", "payload", False)],
+    "fire_event":                 [("event_type", "event_type", True), ("event_data", "payload", False)],
     "set_state":                  [("entity_id", "entity_id", True), ("state", "string", True),
                                    ("attributes", "payload", False)],
     "delete_state":               [("entity_id", "entity_id", True)],
